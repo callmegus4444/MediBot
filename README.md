@@ -2,8 +2,6 @@
 
 ![Medical Assistant Thumbnail](./assets/medicalAssistant.png)
 
-> 🎥 **Watch the full project walkthrough:** [YouTube Video](https://youtu.be/BOhKnkrr4Yc)
->
 > 🗂️ **Architecture PDF:** [View Architecture](./assets/MedicalAssistant.pdf)
 
 ---
