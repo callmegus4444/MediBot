@@ -8,3 +8,6 @@ def upload_pdfs_api(files):
 
 def ask_question(question):
     return requests.post(f"{API_URL}/ask/",data={"question":question})
+
+def ask_question_strict(question):
+    return requests.post(f"{API_URL}/ask/strict/",data={"question":question},timeout=60)
