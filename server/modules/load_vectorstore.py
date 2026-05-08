@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from tqdm.auto import tqdm
 from pinecone import Pinecone, ServerlessSpec
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 load_dotenv()
@@ -43,7 +43,7 @@ index=pc.Index(PINECONE_INDEX_NAME)
 # load,split,embed and upsert pdf docs content
 
 def load_vectorstore(uploaded_files):
-    embed_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    embed_model = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001", output_dimensionality=768)
     file_paths = []
 
     for file in uploaded_files:

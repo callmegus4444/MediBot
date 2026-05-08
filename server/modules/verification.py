@@ -16,18 +16,19 @@ from langchain_groq import ChatGroq
 from logger import logger
 from schemas.strict import ABSTENTION_SENTENCE, Reference
 
-VERIFICATION_SYSTEM = """You are the Verification Agent for a strict clinical answering system.
+VERIFICATION_SYSTEM = """You are the Verification Agent for a clinical answering system aimed at doctors.
 
-Your job is to decide whether the evidence is sufficient to support a factual answer.
+Your job is to decide whether the supplied evidence (PubMed abstracts and any internal document chunks) lets us give a useful, evidence-grounded answer to the doctor's question.
 
 Rules:
-- Do not generate the final answer.
-- Verify each proposed claim against evidence.
-- A claim is supported only if at least one source directly supports it.
-- Prefer two independent sources for treatment, diagnosis, safety, or guideline claims.
-- If sources conflict, mark conflict and lower confidence.
-- If evidence is missing, stale, indirect, or not clinically applicable, mark insufficient.
-- Do not fill gaps with medical knowledge.
+- Do not generate the final answer text.
+- A claim is supported if at least one source's text (title, abstract, or chunk) directly mentions or implies it.
+- Be permissive on minor typos in the user's question (e.g., "twll" -> "tell"), abbreviations, and casual phrasing — interpret intent.
+- Treat peer-reviewed PubMed abstracts as Tier-A evidence on their own; even one clearly relevant abstract is SUFFICIENT to set evidenceStatus to "partial" or "sufficient".
+- For widely established medical facts (e.g., symptoms of common diseases, mechanism of drugs, basic anatomy), you may treat the question as answerable even if the supplied evidence only partially covers it — set evidenceStatus to "partial" and mustAbstain to false.
+- Only mark "insufficient" and mustAbstain true when: (a) NONE of the sources discuss the question's topic at all, AND (b) the question is NOT about a well-established mainstream medical concept.
+- If sources contradict each other, mark conflictsDetected true and choose "conflicting".
+- Default mustAbstain to FALSE unless you have a clear reason to abstain.
 - Return valid JSON only, with no prose, no markdown."""
 
 
@@ -62,13 +63,13 @@ Return this exact JSON shape:
 RESPONSE_SYSTEM = """You are the Response Generator Agent for MediBot strict mode. Your audience is doctors.
 
 Rules:
-- Use only verified claims supplied by the Verification Agent.
-- Do not add medical facts from memory.
-- Do not guess.
-- Do not provide unsupported diagnosis, dosing, treatment, or safety claims.
+- Primarily use the verified claims supplied by the Verification Agent.
+- When evidenceStatus is "partial" and the question is about a well-established mainstream medical fact (e.g., common disease symptoms, standard drug classes, basic physiology), you MAY supplement verified claims with your general clinical knowledge — but clearly note which parts are from the supplied sources and which are general knowledge.
+- Do not guess on novel, complex, or treatment-specific claims without source support.
+- Do not provide unsupported specific dosing or diagnostic criteria without a cited source.
 - Use concise clinical language.
-- If mustAbstain is true or evidenceStatus is insufficient/conflicting, the answer field must be exactly:
-  "I do not have sufficient verified evidence to answer this question."
+- Only set the answer field to "I do not have sufficient verified evidence to answer this question." when mustAbstain is explicitly true OR evidenceStatus is "insufficient" or "conflicting".
+- When evidenceStatus is "partial" or "sufficient", always produce a real clinical answer — never refuse.
 - Return valid JSON only, no prose, no markdown."""
 
 
@@ -96,7 +97,7 @@ _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 def _llm() -> ChatGroq:
     return ChatGroq(
         groq_api_key=os.getenv("GROQ_API_KEY"),
-        model_name=os.getenv("GROQ_MODEL", "llama3-70b-8192"),
+        model_name=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
         temperature=0,
     )
 
@@ -221,3 +222,81 @@ def generate(
         caveats = []
 
     return answer, status, [str(c) for c in cited], [str(c) for c in caveats]
+
+
+SYNTH_SYSTEM = """You are MediBot, a clinical assistant for doctors.
+
+You will be given a doctor's question plus a list of source materials (PubMed abstracts and/or chunks from uploaded internal documents). Your job:
+
+1. Write a concise, professional clinical answer.
+2. Prefer specifics from the supplied sources whenever they are relevant — cite them by their `id` field using inline tags like [pubmed_12345] or [internal_3] right after the claim.
+3. For well-established medical facts (common disease symptoms, standard drug classes, basic physiology, diagnostic criteria taught in medical school), you MAY use your general clinical knowledge even if the supplied abstracts only tangentially cover the topic. Mark such sentences with the suffix [general clinical knowledge].
+4. Combine source-cited specifics with general knowledge fluently — do not write two separate sections.
+5. If multiple sources discuss the same point, cite the strongest 1-2.
+6. Use plain clinical language. No marketing tone, no hype.
+7. Do NOT invent specific dosages, statistics, or trial outcomes that are not in the sources.
+8. Set status to "insufficient_evidence" ONLY when the question is genuinely outside mainstream medicine AND no source covers it. For mainstream clinical questions, always answer.
+
+Output ONLY valid JSON, no prose, no markdown fences."""
+
+
+SYNTH_USER_TMPL = """Doctor question:
+{question}
+
+Internal document chunks (uploaded PDFs):
+{internal_json}
+
+External peer-reviewed sources (PubMed):
+{external_json}
+
+Return this exact JSON shape:
+{{
+  "answer": "string (the clinical answer with inline [source_id] citations)",
+  "status": "answered|partial|insufficient_evidence",
+  "citedSourceIds": ["source_id_1", "source_id_2"]
+}}"""
+
+
+def synthesize_from_sources(
+    question: str,
+    *,
+    internal_chunks: List[dict],
+    references: List[Reference],
+) -> Tuple[str, str, List[str]]:
+    """One-shot answer synthesis from sources. Returns (answer, status, citedSourceIds)."""
+    user_msg = SYNTH_USER_TMPL.format(
+        question=question,
+        internal_json=json.dumps(_internal_payload(internal_chunks), ensure_ascii=False),
+        external_json=json.dumps(_external_payload(references), ensure_ascii=False),
+    )
+    try:
+        result = _llm().invoke(
+            [
+                {"role": "system", "content": SYNTH_SYSTEM},
+                {"role": "user", "content": user_msg},
+            ]
+        )
+    except Exception as exc:
+        logger.warning(f"Synthesizer LLM call failed: {exc}")
+        return ABSTENTION_SENTENCE, "insufficient_evidence", []
+
+    parsed = _extract_json(getattr(result, "content", "") or str(result))
+    if not isinstance(parsed, dict):
+        logger.warning("Synthesizer returned non-JSON response")
+        return ABSTENTION_SENTENCE, "insufficient_evidence", []
+
+    answer = str(parsed.get("answer") or "").strip()
+    status = parsed.get("status") or "answered"
+    cited = parsed.get("citedSourceIds") or []
+    if not isinstance(cited, list):
+        cited = []
+
+    if status not in ("answered", "partial", "insufficient_evidence"):
+        status = "answered"
+
+    if status == "insufficient_evidence":
+        return ABSTENTION_SENTENCE, "insufficient_evidence", []
+    if not answer:
+        return ABSTENTION_SENTENCE, "insufficient_evidence", []
+
+    return answer, status, [str(c) for c in cited]

@@ -61,19 +61,30 @@ def abstention_response(
     external_confidence: float = 0.0,
     conflicts: bool = False,
     evidence_status: EvidenceStatus = "insufficient",
+    suggestions: Optional[List[Reference]] = None,
 ) -> StrictAnswerResponse:
+    refs = list(suggestions or [])
+    for r in refs:
+        r.usedInAnswer = False
     return StrictAnswerResponse(
         requestId=request_id,
         answer=ABSTENTION_SENTENCE,
         confidenceScore=0,
         status="conflicting_evidence" if evidence_status == "conflicting" else "insufficient_evidence",
-        references=[],
+        references=refs,
         verification=VerificationSummary(
             evidenceStatus=evidence_status,
             unsupportedClaimsRemoved=0,
             conflictsDetected=conflicts,
             internalRagConfidence=internal_confidence,
             externalEvidenceConfidence=external_confidence,
+        ),
+        ui=UiHints(
+            emptyReferencesMessage=(
+                "No related sources found on PubMed for this query."
+                if not refs
+                else "Suggested reading (verifier could not confirm a direct answer)"
+            )
         ),
     )
 

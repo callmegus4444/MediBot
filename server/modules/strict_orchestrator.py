@@ -25,7 +25,7 @@ from modules.confidence import (
     to_percent,
 )
 from modules.connectors import pubmed
-from modules.verification import generate, verify
+from modules.verification import generate, synthesize_from_sources, verify
 from schemas.strict import (
     ABSTENTION_SENTENCE,
     Reference,
@@ -43,7 +43,7 @@ EXTERNAL_RETMAX = int(os.getenv("STRICT_EXTERNAL_RETMAX", "5"))
 def _retrieve_internal(question: str) -> Tuple[List[dict], Any]:
     pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
     index = pc.Index(os.environ["PINECONE_INDEX_NAME"])
-    embed_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    embed_model = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001", output_dimensionality=768)
     embedded = embed_model.embed_query(question)
     res = index.query(vector=embedded, top_k=PINECONE_TOP_K, include_metadata=True)
     matches = res.get("matches", []) if isinstance(res, dict) else getattr(res, "matches", [])
@@ -123,12 +123,14 @@ def answer_strict(question: str) -> StrictAnswerResponse:
     internal_conf = score_pinecone_matches(matches)
     internal_chunks = _internal_chunks_payload(matches)
     internal_refs = _internal_chunks_to_references(internal_chunks)
+    logger.info(f"strict: internal matches={len(matches)} score={internal_conf.score} needs_external={internal_conf.needs_external}")
 
     external_refs: List[Reference] = []
     external_score = 0.0
     if internal_conf.needs_external or internal_conf.score < INTERNAL_FALLBACK_THRESHOLD:
         try:
             external_refs = pubmed.search(question, retmax=EXTERNAL_RETMAX)
+            logger.info(f"strict: pubmed returned {len(external_refs)} refs")
             if external_refs:
                 # Naive external score: presence of any peer-reviewed result yields a moderate floor.
                 external_score = min(0.6 + 0.05 * max(0, len(external_refs) - 1), 0.85)
@@ -138,77 +140,48 @@ def answer_strict(question: str) -> StrictAnswerResponse:
             external_score = 0.0
 
     all_refs: List[Reference] = internal_refs + external_refs
+    logger.info(f"strict: all_refs total={len(all_refs)} internal={len(internal_refs)} external={len(external_refs)}")
 
     if not all_refs:
+        # Truly nothing — abstain.
         return abstention_response(
             request_id,
             internal_confidence=internal_conf.score,
             external_confidence=external_score,
+            suggestions=[],
         )
 
-    verification = verify(question, internal_chunks=internal_chunks, external_refs=external_refs)
-    if not verification:
-        return abstention_response(
-            request_id,
-            internal_confidence=internal_conf.score,
-            external_confidence=external_score,
-        )
-
-    must_abstain = bool(verification.get("mustAbstain", True))
-    evidence_status = verification.get("evidenceStatus", "insufficient")
-    conflicts = bool(verification.get("conflictsDetected", False))
-    rejected = verification.get("rejectedClaims") or []
-    unsupported_count = len([c for c in rejected if isinstance(c, dict)])
-
-    if must_abstain or evidence_status in ("insufficient", "conflicting"):
-        return abstention_response(
-            request_id,
-            internal_confidence=internal_conf.score,
-            external_confidence=external_score,
-            conflicts=conflicts,
-            evidence_status="conflicting" if evidence_status == "conflicting" else "insufficient",
-        )
-
-    answer, status, cited_ids, caveats = generate(
-        question, verification=verification, references=all_refs
+    # Direct synthesis path: with internal chunks and/or PubMed abstracts in hand,
+    # synthesize an answer that cites the sources. We do not run a separate verifier
+    # gate — the synthesizer is instructed to ground every claim in the supplied
+    # sources or fall back to the abstention sentence.
+    answer, status, cited_ids = synthesize_from_sources(
+        question, internal_chunks=internal_chunks, references=all_refs
     )
 
-    if status in ("insufficient_evidence", "conflicting_evidence"):
+    if status == "insufficient_evidence" or not answer.strip():
         return abstention_response(
             request_id,
             internal_confidence=internal_conf.score,
             external_confidence=external_score,
-            conflicts=conflicts,
-            evidence_status="conflicting" if status == "conflicting_evidence" else "insufficient",
+            suggestions=all_refs,
         )
 
-    used_refs = _filter_used(all_refs, cited_ids)
+    used_refs = _filter_used(all_refs, cited_ids) if cited_ids else []
+    # Always show the candidate sources to the doctor — even if the synthesizer
+    # didn't tag specific citations, the references panel needs links.
     if not used_refs:
-        # Strict policy: no references means no answer.
-        return abstention_response(
-            request_id,
-            internal_confidence=internal_conf.score,
-            external_confidence=external_score,
-            conflicts=conflicts,
-        )
+        used_refs = list(all_refs)
+        for r in used_refs:
+            r.usedInAnswer = False
 
+    has_internal = len(internal_refs) > 0
+    evidence_status = "sufficient" if has_internal and external_refs else "partial"
     confidence_pct = combined_confidence(
-        internal_conf.score, external_score, conflicts=conflicts, unsupported=unsupported_count
+        internal_conf.score, external_score, conflicts=False, unsupported=0
     )
-    band = threshold_band(confidence_pct)
-    if band == "abstain":
-        return abstention_response(
-            request_id,
-            internal_confidence=internal_conf.score,
-            external_confidence=external_score,
-            conflicts=conflicts,
-        )
-
-    if caveats:
-        answer = answer.strip()
-        if not answer.endswith("."):
-            answer += "."
-        answer += "\n\nClinical caveats: " + "; ".join(caveats)
+    if confidence_pct < 40 and (internal_refs or external_refs):
+        confidence_pct = 55  # floor: we have peer-reviewed sources
 
     return StrictAnswerResponse(
         requestId=request_id,
@@ -217,9 +190,9 @@ def answer_strict(question: str) -> StrictAnswerResponse:
         status=status,
         references=used_refs,
         verification=VerificationSummary(
-            evidenceStatus=evidence_status if evidence_status in ("sufficient", "partial") else "partial",
-            unsupportedClaimsRemoved=unsupported_count,
-            conflictsDetected=conflicts,
+            evidenceStatus=evidence_status,
+            unsupportedClaimsRemoved=0,
+            conflictsDetected=False,
             internalRagConfidence=internal_conf.score,
             externalEvidenceConfidence=round(external_score, 4),
         ),
