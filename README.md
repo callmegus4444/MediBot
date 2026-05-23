@@ -1,174 +1,214 @@
-# 📅 AI Medical Assistant Chatbot — RAG-based Application
+# 🩺 MediBot — AI Medical Assistant Chatbot
+
+> Evidence-grounded clinical Q&A for doctors. Searches PubMed, trusted medical websites, the FDA drug-label database, ClinicalTrials.gov, and your own uploaded PDFs — in parallel — then streams a cited answer back.
 
 ---
 
-## 🧠 Project Overview
+## ✨ What it does
 
-This application is a **Medical Domain Chatbot** built using **Retrieval-Augmented Generation (RAG)**. It allows users to upload their own medical documents (e.g., textbooks, reports), and the system intelligently answers queries by retrieving the most relevant content before generating a final response.
+Ask any clinical question. MediBot:
 
----
-
-## 🎓 What is RAG?
-
-**RAG (Retrieval-Augmented Generation)** enhances language models by supplying relevant external context from a knowledge base, preventing hallucinations and improving accuracy, especially for factual or specialized domains like **medicine**.
-
----
-
-## 🔄 Architecture
-
-```
-User Input
-   ↓
-Query Embedding → Pinecone Vector DB ← Embedded Chunks ← Chunking ← PDF Loader
-   ↓
-Retrieved Docs
-   ↓
-     RAG Chain (Groq + LangChain)
-   ↓
-LLM-generated Answer
-```
-
-For a detailed view, refer to the **[MedicalAssistant.pdf](./assets/MedicalAssistant.pdf)**
+1. Embeds the question with **Gemini Embedding 001** and searches your uploaded PDFs via **Pinecone** (scoped to the active library namespace).
+2. Fans out **in parallel** to:
+   - **PubMed** (peer-reviewed literature, via NCBI E-utilities)
+   - **Tavily Web Search** restricted to a whitelist of trusted medical domains (WHO, CDC, FDA, NIH, NEJM, BMJ, Mayo Clinic, Cochrane, NICE, …)
+   - **OpenFDA** (live FDA drug labels — indications, dosage, contraindications, warnings, interactions)
+   - **ClinicalTrials.gov v2** (ongoing and completed trials)
+3. Feeds all evidence + the last 6 turns of conversation history to a **Groq Llama 3.3 70B** synthesizer.
+4. **Streams** the answer back token-by-token over SSE, with inline `[source_id]` citations.
+5. Renders distinct source badges (PubMed · Web · Internal · FDA · Trial), credibility tiers, and a final confidence score.
+6. Auto-saves the chat to disk so the doctor can revisit prior sessions.
 
 ---
 
-## 📚 Features
+## 🧱 Architecture (high level)
 
-- Upload medical PDFs (notes, books, etc.)
-- Auto-extracts text and splits into semantic chunks
-- Embeds using Google/BGE embeddings
-- Stores vectors in **Pinecone DB**
-- Uses **Groq's LLaMA3-70B** via LangChain
-- FastAPI backend with endpoints for file upload and Q\&A
+```
+┌────────────────────────── STREAMLIT CLIENT ──────────────────────────┐
+│  Library selector   New chat / load / delete   🌐 Web toggle         │
+│  Streaming chat (SSE)        Reference panel with typed badges        │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │ HTTP + SSE
+                               ▼
+┌──────────────────────────── FASTAPI SERVER ──────────────────────────┐
+│   /upload_pdfs/   /libraries/   /ask/strict/   /ask/strict/stream/   │
+│   /chat/save/     /chat/list/   /chat/{id}/   (DELETE chat)          │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+   ┌─── Pinecone (per-library namespaces) ────────────────────────────┐
+   │                                                                   │
+   │   ┌── PubMed ──┐  ┌── Tavily web ──┐  ┌── OpenFDA ──┐  ┌── CT.gov ┐ │
+   │   │ E-utils    │  │ whitelist 35   │  │ drug labels │  │ studies   │ │
+   │   └────────────┘  └────────────────┘  └─────────────┘  └───────────┘ │
+   └────────────────────────── all in parallel ─────────────────────────┘
+                               │
+                               ▼
+              Groq Llama 3.3 70B  →  streamed prose with [source_id]
+```
+
+See [`SYSTEM_DESIGN.md`](./SYSTEM_DESIGN.md) for the full design.
 
 ---
 
-## 🌐 Tech Stack
+## 🚀 Quick start
 
-| Component  | Tech Used                  |
-| ---------- | -------------------------- |
-| LLM        | Groq API (LLaMA3-70B)      |
-| Embeddings | Google Generative AI / BGE |
-| Vector DB  | Pinecone                   |
-| Framework  | LangChain                  |
-| Backend    | FastAPI                    |
-| Deployment | Render                     |
-
----
-
-## 📚 API Endpoints
-
-```http
-POST /upload_pdfs/ --- Upload one or more PDF files
-
-POST /ask/ --- Ask a question --- Form field: `question`
-
-```
-
----
-
-## 📁 Folder Structure
-
-```
-└── 📁assets
-    ├── DIABETES.pdf
-    ├── MedicalAssistant.pdf
-    └── medicalAssistant.png
-```
-
-```
-└── 📁client
-    └── 📁__pycache__
-        ├── config.cpython-311.pyc
-    └── 📁components
-        └── 📁__pycache__
-            ├── chatUI.cpython-311.pyc
-            ├── history_download.cpython-311.pyc
-            ├── upload.cpython-311.pyc
-        ├── chatUI.py
-        ├── history_download.py
-        ├── upload.py
-    └── 📁utils
-        └── 📁__pycache__
-            ├── api.cpython-311.pyc
-        ├── api.py
-    ├── app.py
-    ├── config.py
-    └── requirements.txt
-```
-
-```
-└── 📁server
-    └── 📁__pycache__
-        ├── logger.cpython-311.pyc
-        ├── main.cpython-311.pyc
-        ├── test.cpython-311.pyc
-    └── 📁middlewares
-        └── 📁__pycache__
-            ├── exception_handlers.cpython-311.pyc
-        ├── exception_handlers.py
-    └── 📁modules
-        └── 📁__pycache__
-            ├── llm.cpython-311.pyc
-            ├── load_vectorstore.cpython-311.pyc
-            ├── query_handlers.cpython-311.pyc
-        ├── llm.py
-        ├── load_vectorstore.py
-        ├── pdf_handlers.py
-        ├── query_handlers.py
-    └── 📁routes
-        └── 📁__pycache__
-            ├── ask_question.cpython-311.pyc
-            ├── upload_pdfs.cpython-311.pyc
-        ├── ask_question.py
-        ├── upload_pdfs.py
-    └── 📁uploaded_docs
-        ├── DIABETES.pdf
-        ├── Supratim Nag - LOR.pdf
-    ├── .env
-    ├── logger.py
-    ├── main.py
-    ├── requirements.txt
-    └── test.py
-```
-
----
-
-## ⚡ Quick Setup
+### 1. Server
 
 ```bash
-# Clone the repo
-$ git clone https://github.com/snsupratim/medicalAssistant.git
-$ cd medicalAssistant/server
+cd server
+uv venv && .venv/Scripts/activate   # macOS/Linux: source .venv/bin/activate
+uv pip install -r requirements.txt
+cp .env.example .env                # then fill in keys (see below)
+uvicorn main:app --reload --port 8000
+```
 
-# Create virtual env
-$ uv venv
-$ .venv/bin/activate  # Windows: venv\Scripts\activate
+### 2. Client
 
-# Install dependencies
-$ uv pip install -r requirements.txt
+```bash
+cd client
+uv venv && .venv/Scripts/activate
+uv pip install -r requirements.txt
+streamlit run app.py
+```
 
-# Set environment variables (.env)
-GOOGLE_API_KEY=...
-GROQ_API_KEY=...
-PINECONE_API_KEY=...
+Open **http://localhost:8501**.
 
-# Run the server
-$ uvicorn main:app --reload --port 8000
+### 3. Environment (`server/.env`)
 
+| Variable | Required | Purpose |
+|---|---|---|
+| `GROQ_API_KEY` | ✅ | Llama 3.3 70B inference |
+| `GOOGLE_API_KEY` | ✅ | Gemini embeddings (768-dim) |
+| `PINECONE_API_KEY` | ✅ | Vector store |
+| `PINECONE_INDEX_NAME` | ✅ | e.g. `medicalindex` |
+| `TAVILY_API_KEY` | ✅ for web search | Whitelisted medical web search |
+| `GROQ_MODEL` | optional | default `llama-3.3-70b-versatile` |
+| `STRICT_TOP_K` | optional | Pinecone top-k (default `5`) |
+| `STRICT_EXTERNAL_RETMAX` | optional | PubMed max results (default `5`) |
+| `STRICT_WEB_RETMAX` | optional | Web max results (default `5`) |
+| `STRICT_FDA_RETMAX` | optional | OpenFDA max results (default `3`) |
+| `STRICT_TRIALS_RETMAX` | optional | ClinicalTrials.gov max (default `3`) |
+| `NCBI_API_KEY` | optional | Raises PubMed rate limit to 10 rps |
+| `NCBI_CONTACT_EMAIL` | optional | Contact for NCBI policy |
+| `OPENFDA_API_KEY` | optional | Raises OpenFDA rate limit |
+| `CHAT_HISTORY_DIR` | optional | Override server chat-history dir |
 
-$ cd medicalAssistant/client
+---
 
-# Create virtual env
-$ uv venv
-$ .venv/bin/activate  # Windows: venv\Scripts\activate
+## 🔌 API
 
-# Install dependencies
-$ uv pip install -r requirements.txt
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/upload_pdfs/` | Multipart upload `files[]` + form `library` (string). Embeds and upserts into the library's Pinecone namespace. |
+| `GET`  | `/libraries/` | Lists existing library namespaces. |
+| `POST` | `/ask/` | General-mode (legacy) RAG answer. |
+| `POST` | `/ask/strict/` | Strict evidence-grounded answer. Form fields: `question`, `library`, `use_web` (bool), `history_json` (JSON list of `{role, content}`). |
+| `POST` | `/ask/strict/stream/` | Same inputs as `/ask/strict/`; returns SSE stream with events `meta` → `references` → `delta`* → `done`. |
+| `POST` | `/chat/save/` | Body `{session_id, title?, library?, messages: [...]}`. |
+| `GET`  | `/chat/list/` | List saved sessions (id, title, library, updatedAt, messageCount). |
+| `GET`  | `/chat/{session_id}/` | Load a saved session. |
+| `DELETE` | `/chat/{session_id}/` | Delete a saved session. |
 
-# Run the server
-$ streamlit run app.py
+Strict response shape (non-stream):
 
-## 🎉 License
+```json
+{
+  "requestId": "uuid",
+  "mode": "strict",
+  "answer": "string with inline [source_id] citations",
+  "confidenceScore": 0-100,
+  "status": "answered | partial | insufficient_evidence | conflicting_evidence",
+  "references": [
+    {
+      "id": "pubmed_12345 | web_0_cdc_gov | openfda_metformin_0 | trial_NCT01234567 | internal_3",
+      "title": "...",
+      "source": "PubMed | cdc.gov | OpenFDA | ClinicalTrials.gov | Internal Library",
+      "sourceType": "peer_reviewed_journal | web | drug_label | clinical_trial | internal_pdf",
+      "url": "...",
+      "credibilityTier": "A | B | C",
+      "publishedAt": "YYYY-MM-DD",
+      "keyFindings": ["..."]
+    }
+  ],
+  "verification": {
+    "evidenceStatus": "sufficient | partial | insufficient | conflicting",
+    "internalRagConfidence": 0.0,
+    "externalEvidenceConfidence": 0.0
+  }
+}
+```
 
-This project is licensed under the MIT License.
+---
+
+## 🌐 Trusted-domain whitelist (web search)
+
+WHO, NIH, NCBI/PMC, MedlinePlus, CDC, FDA, EMA, NICE, Cochrane, AHRQ, Mayo Clinic, Cleveland Clinic, Hopkins Medicine, UpToDate, Merck Manuals, AAFP, AMA, ACC, Heart.org, Diabetes.org, Cancer.gov, Cancer.org, RxList, Drugs.com, Medscape, BMJ, NEJM, The Lancet, JAMA Network, Nature, ScienceDirect, Springer, Wiley.
+
+Government and major-journal domains get Tier **A**, the rest Tier **B**.
+
+---
+
+## 📚 Libraries (no auth)
+
+Each "library" is an isolated Pinecone namespace. The sidebar lets the doctor:
+
+- Pick an existing library
+- Create a new one (e.g. `cardiology`, `pediatrics`)
+- Upload PDFs into it
+- Query only that library's documents
+
+No authentication — libraries are shared across anyone with access to the deployment. Add auth in front (e.g. nginx + basic auth) for production.
+
+---
+
+## 💬 Chat history
+
+- Auto-saved server-side as `server/chat_history/<session_id>.json` after every assistant turn.
+- Sidebar lists prior sessions; click to load, 🗑 to delete.
+- Each conversation stores the last assistant message's references too, so they re-render when you reload an old chat.
+- Also downloadable as `.txt` or `.json` from the sidebar.
+
+---
+
+## 🛡 Safety design
+
+- **Fail-closed**: any retrieval/LLM error → abstention sentence, never a guess.
+- **No diagnostic claims**; the synthesizer prompt forbids inventing dosages, statistics, or trial outcomes.
+- **Source citations mandatory** inline (`[source_id]`). General-knowledge sentences are tagged `[general clinical knowledge]`.
+- **Strict mode only** in the new UI (general mode endpoint stays for legacy callers).
+
+---
+
+## 🧩 Tech stack
+
+| Layer | Tech |
+|---|---|
+| LLM | Groq Llama 3.3 70B Versatile |
+| Embeddings | Google Gemini Embedding 001 (768-dim) |
+| Vector store | Pinecone Serverless (dotproduct, AWS us-east-1) |
+| Web search | Tavily (whitelisted domains) |
+| Drug data | OpenFDA `/drug/label.json` |
+| Trials | ClinicalTrials.gov API v2 |
+| Backend | FastAPI + Uvicorn |
+| Streaming | Server-Sent Events |
+| Frontend | Streamlit |
+| Package mgr | `uv` |
+
+---
+
+## 🗺 Roadmap
+
+Already shipped: web search, OpenFDA, ClinicalTrials.gov, conversation memory, streaming, libraries, persistent history.
+
+Still planned (see `SYSTEM_DESIGN.md` §16):
+
+- UMLS query expansion ("heart attack" → MI / AMI)
+- Cross-encoder reranker on top of Pinecone ANN
+- Authentication / multi-tenancy
+- LangSmith + Prometheus observability
+
+---
+
+## 📜 License
+
+MIT.

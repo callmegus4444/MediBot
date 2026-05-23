@@ -1,6 +1,6 @@
 # MediBot — Comprehensive System Design Documentation
 
-> **Version:** 1.0.0 | **Last Updated:** May 2026 | **Status:** Active Development
+> **Version:** 2.0.0 | **Last Updated:** May 2026 | **Status:** Active Development
 
 ---
 
@@ -13,16 +13,19 @@
 5. [Data Flow & Pipeline](#5-data-flow--pipeline)
 6. [API Reference](#6-api-reference)
 7. [AI / LLM Pipeline](#7-ai--llm-pipeline)
-8. [Vector Database & Embeddings](#8-vector-database--embeddings)
+8. [Vector Database, Libraries & Embeddings](#8-vector-database-libraries--embeddings)
 9. [Evidence Verification Layer](#9-evidence-verification-layer)
 10. [Confidence Scoring System](#10-confidence-scoring-system)
 11. [External Connectors](#11-external-connectors)
-12. [Frontend (Streamlit Client)](#12-frontend-streamlit-client)
-13. [Security & Safety Design](#13-security--safety-design)
-14. [Environment & Configuration](#14-environment--configuration)
-15. [Deployment Architecture](#15-deployment-architecture)
-16. [Future Integrations](#16-future-integrations)
-17. [Known Issues & Fixes](#17-known-issues--fixes)
+12. [Streaming Pipeline (SSE)](#12-streaming-pipeline-sse)
+13. [Conversation Memory](#13-conversation-memory)
+14. [Chat History Persistence](#14-chat-history-persistence)
+15. [Frontend (Streamlit Client)](#15-frontend-streamlit-client)
+16. [Security & Safety Design](#16-security--safety-design)
+17. [Environment & Configuration](#17-environment--configuration)
+18. [Deployment Architecture](#18-deployment-architecture)
+19. [Future Integrations](#19-future-integrations)
+20. [Known Issues & Fixes](#20-known-issues--fixes)
 
 ---
 
@@ -32,11 +35,11 @@
 
 ### Core Goals
 
-- Provide fast, accurate answers to clinical questions
-- Ground responses in peer-reviewed literature (PubMed) and internal clinical PDFs
-- Operate in two modes: **General Mode** (fast, RAG-based) and **Strict Mode** (evidence-verified, citation-backed)
-- Never hallucinate — fail safely with abstention when evidence is insufficient
-- Surface references, confidence scores, and source citations for every answer
+- Provide fast, accurate, **cited** answers to clinical questions.
+- Ground every response in (a) peer-reviewed PubMed literature, (b) trusted medical websites, (c) FDA drug labels, (d) ClinicalTrials.gov studies, and (e) the doctor's own uploaded PDFs.
+- Fail safely with abstention when evidence is insufficient — never hallucinate.
+- Stream answers token-by-token so the doctor sees progress immediately.
+- Support per-doctor / per-specialty PDF libraries via Pinecone namespaces (no auth, identified by name).
 
 ### Who It's For
 
@@ -44,7 +47,7 @@
 |---|---|
 | Doctors / Clinicians | Quick reference during consultations |
 | Medical Researchers | Literature-backed Q&A with citations |
-| Hospital Admin | Upload internal clinical PDFs for querying |
+| Hospital Admin | Upload internal clinical PDFs per specialty library |
 
 ---
 
@@ -54,20 +57,19 @@
 ┌─────────────────────────────────────────────────────────┐
 │                     CLIENT LAYER                        │
 │              Streamlit Web Application                  │
-│   ┌──────────┐  ┌──────────────┐  ┌─────────────────┐  │
-│   │ PDF      │  │  Chat UI     │  │ History         │  │
-│   │ Uploader │  │  (chatUI.py) │  │ Download        │  │
-│   └──────────┘  └──────────────┘  └─────────────────┘  │
+│ ┌──────────┐ ┌────────────┐ ┌──────────┐ ┌───────────┐ │
+│ │ Library  │ │ Conversations│ │ Web tog  │ │ Streaming│ │
+│ │ selector │ │   sidebar   │ │  switch  │ │ chat UI  │ │
+│ └──────────┘ └────────────┘ └──────────┘ └───────────┘ │
 └─────────────────────────┬───────────────────────────────┘
-                          │ HTTP (REST)
+                          │ HTTP + Server-Sent Events
                           ▼
 ┌─────────────────────────────────────────────────────────┐
 │                    SERVER LAYER                         │
 │                FastAPI Application                      │
-│  ┌──────────────┐  ┌────────────┐  ┌─────────────────┐ │
-│  │ /upload_pdfs │  │ /ask/      │  │ /ask/strict/    │ │
-│  │ (PDF Ingest) │  │ (General)  │  │ (Strict Mode)   │ │
-│  └──────────────┘  └────────────┘  └─────────────────┘ │
+│  /upload_pdfs/  /libraries/                            │
+│  /ask/  /ask/strict/  /ask/strict/stream/              │
+│  /chat/save/  /chat/list/  /chat/{id}/  (DELETE)       │
 │                          │                              │
 │              ┌───────────┴───────────┐                  │
 │              │                       │                  │
@@ -77,17 +79,17 @@
 │      └───────┬──────┘    └──────────┬──────────┘       │
 └──────────────┼───────────────────────┼──────────────────┘
                │                       │
-    ┌──────────▼──────┐    ┌───────────▼──────────────┐
-    │  Groq LLM       │    │   Groq LLM (Verify+Gen)  │
-    │ (llama-3.3-70b) │    │   + PubMed Connector      │
-    └──────────┬──────┘    └───────────┬──────────────┘
-               │                       │
-               └───────────┬───────────┘
-                           │
-               ┌───────────▼───────────┐
-               │   Pinecone Vector DB   │
-               │  (768-dim, dot-product)│
-               └───────────────────────┘
+   ┌───────────▼──────┐    ┌───────────▼──────────────┐
+   │  Pinecone vector │    │  ┌─PubMed─┐ ┌─Tavily Web─┐│
+   │  store           │    │  ├─OpenFDA┤ ┌─CT.gov─────┤│
+   │  (per-library    │    │  └────────┘ └────────────┘│
+   │   namespaces)    │    │      (parallel fan-out)   │
+   └──────────────────┘    └──────────────┬────────────┘
+                                          ▼
+                          Groq Llama 3.3 70B (synthesizer)
+                                          │
+                                          ▼
+                       SSE: meta → references → deltas → done
 ```
 
 ---
@@ -96,107 +98,83 @@
 
 ### Backend
 
-| Layer | Technology | Version | Purpose |
-|---|---|---|---|
-| **Web Framework** | FastAPI | Latest | REST API, async request handling |
-| **ASGI Server** | Uvicorn | Latest | Production ASGI server |
-| **Language** | Python | 3.11+ | Core application language |
-| **LLM Runtime** | LangChain | Latest | LLM orchestration & chain management |
-| **LLM Provider** | Groq (via `langchain-groq`) | Latest | Ultra-fast LLM inference |
-| **LLM Model** | Llama 3.3 70B Versatile | llama-3.3-70b-versatile | Primary language model |
-| **Embeddings** | Google Gemini Embedding 001 | models/gemini-embedding-001 | 768-dim text embeddings |
-| **Vector Store** | Pinecone Serverless | Latest | Semantic search / RAG retrieval |
-| **Data Validation** | Pydantic v2 | Latest | Request/response schemas |
-| **PDF Parsing** | PyPDF + LangChain Community | Latest | PDF ingestion & text extraction |
-| **Text Splitting** | LangChain RecursiveCharacterTextSplitter | Latest | Chunk documents for embedding |
-| **HTTP Client** | Requests | Latest | External API calls (PubMed) |
-| **Logging** | Loguru | Latest | Structured application logging |
-| **Environment** | python-dotenv | Latest | .env configuration management |
+| Layer | Technology | Purpose |
+|---|---|---|
+| Web framework | FastAPI | REST API + SSE streaming |
+| ASGI server | Uvicorn | Production ASGI |
+| Language | Python 3.11+ | Core |
+| LLM orchestration | LangChain | Chain management |
+| LLM provider | Groq (`langchain-groq`) | Ultra-fast inference |
+| LLM model | Llama 3.3 70B Versatile | Synthesis, drafting |
+| Embeddings | Google Gemini Embedding 001 | 768-dim |
+| Vector store | Pinecone Serverless | Semantic search, per-library namespaces |
+| Validation | Pydantic v2 | Schemas |
+| PDF parsing | PyPDFLoader + RecursiveCharacterTextSplitter | Ingestion |
+| HTTP | Requests | All external APIs |
+| Logging | Loguru | Structured logs |
+| Env | python-dotenv | `.env` loading |
 
 ### Frontend
 
-| Layer | Technology | Version | Purpose |
-|---|---|---|---|
-| **UI Framework** | Streamlit | Latest | Web UI for the chatbot |
-| **HTTP Client** | Requests | Latest | Calls to FastAPI backend |
+| Layer | Tech | Purpose |
+|---|---|---|
+| UI | Streamlit | Web UI |
+| HTTP/SSE | Requests (stream mode) | Backend calls |
 
 ### External Services
 
 | Service | Purpose | Auth |
 |---|---|---|
-| **Groq API** | LLM inference (Llama 3.3 70B) | API Key |
-| **Google Generative AI API** | Text embeddings (Gemini Embedding 001) | API Key |
-| **Pinecone** | Vector database (serverless, AWS us-east-1) | API Key |
-| **PubMed E-utilities (NCBI)** | Peer-reviewed literature retrieval | Optional API Key |
+| Groq API | LLM inference | API key |
+| Google Generative AI | Embeddings | API key |
+| Pinecone | Vector DB | API key |
+| PubMed E-utilities (NCBI) | Peer-reviewed literature | Optional key |
+| **Tavily** | **Whitelisted medical web search** | **API key** |
+| **OpenFDA** | **FDA drug label database** | Optional key |
+| **ClinicalTrials.gov API v2** | **Active and completed trials** | None |
 
 ### Infrastructure
 
-| Component | Technology |
+| Component | Tech |
 |---|---|
-| **Package Manager** | `uv` (ultrafast Python package manager) |
-| **Dependency Isolation** | Python venv (`.venv`) |
-| **Source Control** | Git |
+| Package manager | `uv` |
+| Venv | Python `.venv` |
+| VCS | Git |
 
 ---
 
 ## 4. System Components
 
-### 4.1 Server Components
+### 4.1 Server
 
-#### `server/main.py`
-FastAPI application entry point. Registers all routers and middleware.
+| File | Purpose |
+|---|---|
+| `server/main.py` | FastAPI app, CORS, exception middleware, router registration. |
+| `server/routes/upload_pdfs.py` | `POST /upload_pdfs/`, `GET /libraries/`. |
+| `server/routes/ask_question.py` | `POST /ask/` (legacy general mode). |
+| `server/routes/ask_strict.py` | `POST /ask/strict/` and `POST /ask/strict/stream/`. |
+| `server/routes/chat_history.py` | Session persistence — save / list / load / delete. |
+| `server/modules/strict_orchestrator.py` | Multi-source fan-out + synthesis. Exposes `answer_strict` and `stream_answer_strict`. |
+| `server/modules/verification.py` | Synthesizer (one-shot JSON) and streaming synthesizer (plain prose). |
+| `server/modules/confidence.py` | Internal RAG and combined-confidence scoring. |
+| `server/modules/llm.py` | Legacy general-mode RetrievalQA chain. |
+| `server/modules/load_vectorstore.py` | PDF ingestion → embeddings → Pinecone upsert per library namespace. `sanitize_library()` and `list_libraries()`. |
+| `server/modules/connectors/pubmed.py` | NCBI E-utilities with LLM query rewriting + fallbacks. |
+| `server/modules/connectors/web_search.py` | Tavily search restricted to a whitelist of medical domains. |
+| `server/modules/connectors/openfda.py` | FDA drug-label search (indications, dosage, contraindications, warnings, interactions, mechanism). |
+| `server/modules/connectors/clinicaltrials.py` | ClinicalTrials.gov v2 study search. |
+| `server/schemas/strict.py` | Pydantic models for the strict response. |
 
-#### `server/modules/strict_orchestrator.py`
-The core pipeline engine for **Strict Mode**. Orchestrates:
-1. Pinecone retrieval
-2. Confidence scoring
-3. PubMed fallback (when internal confidence is low)
-4. Verification agent (LLM call)
-5. Response generation agent (LLM call)
-6. Abstention logic (fail-safe)
+### 4.2 Client
 
-#### `server/modules/verification.py`
-Houses two LLM agents:
-- **Verification Agent** — checks if evidence supports the question
-- **Response Generator Agent** — writes the final answer using only verified claims
-
-#### `server/modules/confidence.py`
-Confidence scoring utilities:
-- `score_pinecone_matches()` — scores internal RAG results
-- `combined_confidence()` — merges internal + external scores
-- `threshold_band()` — maps score to action (answer/partial/abstain)
-
-#### `server/modules/llm.py`
-General mode LLM chain using `RetrievalQA` from LangChain Classic.
-
-#### `server/modules/load_vectorstore.py`
-PDF ingestion pipeline: load → split → embed → upsert to Pinecone.
-
-#### `server/modules/connectors/pubmed.py`
-PubMed E-utilities connector. Supports:
-- `esearch` → get PMIDs
-- `esummary` → metadata (title, journal, date)
-- `efetch` → abstract text
-- LLM-powered query rewriting for better PubMed hits
-
-#### `server/schemas/strict.py`
-Pydantic models for the strict-mode response: `StrictAnswerResponse`, `Reference`, `VerificationSummary`, `UiHints`.
-
-### 4.2 Client Components
-
-#### `client/app.py`
-Main Streamlit app entry point.
-
-#### `client/components/chatUI.py`
-Chat interface with two-column layout:
-- Left: Chat messages with status pills and confidence badges
-- Right: Reference panel with PubMed/internal source cards
-
-#### `client/components/upload.py`
-PDF upload widget that calls `/upload_pdfs/` on the backend.
-
-#### `client/utils/api.py`
-HTTP wrapper functions for all API endpoints.
+| File | Purpose |
+|---|---|
+| `client/app.py` | Entrypoint: uploader → sessions → history download → chat. |
+| `client/components/upload.py` | Library selector + PDF uploader (writes to a named namespace). |
+| `client/components/sessions.py` | New chat / list / load / delete saved sessions. |
+| `client/components/chatUI.py` | Streaming chat UI with badges, status pills, ref panel. |
+| `client/components/history_download.py` | Download current session as `.txt` / `.json`. |
+| `client/utils/api.py` | All HTTP + SSE wrappers. |
 
 ---
 
@@ -205,84 +183,73 @@ HTTP wrapper functions for all API endpoints.
 ### 5.1 PDF Upload & Indexing
 
 ```
-User uploads PDF(s)
+User picks/creates a library name (e.g. "cardiology")
        │
        ▼
-FastAPI /upload_pdfs/
+FastAPI /upload_pdfs/  (multipart files[] + library)
        │
        ▼
-PyPDFLoader (LangChain) — parse pages
-       │
-       ▼
-RecursiveCharacterTextSplitter
-  chunk_size=500, chunk_overlap=50
+PyPDFLoader → RecursiveCharacterTextSplitter (500 / 50)
        │
        ▼
 Gemini Embedding 001 (768-dim)
        │
        ▼
-Pinecone Upsert
-  index: "medicalindex"
-  metric: dotproduct
-  cloud: AWS us-east-1
+Pinecone upsert   namespace = sanitize_library("cardiology") = "cardiology"
+       │
+       ▼
+Metadata: {text, source=filename, page, library}
 ```
 
-### 5.2 Strict Mode Query Pipeline
+### 5.2 Strict Mode Query Pipeline (non-stream)
+
+```
+User question  +  library  +  use_web  +  history (last 6 turns)
+     │
+     ▼
+[1] Pinecone semantic search   (top_k=5, namespace=library)
+     │
+     ▼
+[2] Score internal confidence
+     │
+     ├──► [3] PARALLEL connector fan-out (always run):
+     │         PubMed  · Tavily Web (if use_web)  · OpenFDA  · ClinicalTrials.gov
+     │
+     ▼
+[4] Synthesizer (Groq Llama 3.3 70B, temperature=0)
+        Input: question, history, internal_chunks, all references
+        Output JSON: {answer with inline [source_id], status, citedSourceIds}
+     │
+     ▼
+[5] combined_confidence() + status mapping
+     │
+     ▼
+[6] Return StrictAnswerResponse
+```
+
+### 5.3 Strict Mode Stream Pipeline (SSE)
+
+```
+Same evidence-gathering as above (synchronous fan-out)
+     │
+     ▼
+SSE event:  meta        { requestId, library }
+SSE event:  references  [ Reference, ... ]          ← UI renders panel immediately
+     │
+     ▼
+Groq stream() — token deltas
+SSE events: delta       { text }                    ← UI appends to chat bubble
+…
+SSE event:  done        { answer, confidenceScore, status, references (used) }
+```
+
+### 5.4 General Mode Query Pipeline (legacy)
 
 ```
 User question
      │
      ▼
-[1] Pinecone semantic search (top_k=5)
-     │
-     ▼
-[2] Internal confidence scoring
-  score = 0.7 * top_match + 0.3 * volume_factor
-     │
-     ├──(score < 0.50 or no relevant matches)──▶ [3] PubMed fallback
-     │                                                 │
-     │              esearch → esummary → efetch        │
-     │                   (abstracts)                   │
-     │                        │                        │
-     └────────────────────────┘                        │
-              all_refs = internal + external            │
-                        │                              │
-                        ▼                              │
-     [4] Verification Agent (Groq LLM)                 │
-       Input: question + internal chunks + pubmed refs  │
-       Output: {evidenceStatus, verifiedClaims,         │
-                mustAbstain, conflictsDetected}          │
-                        │                              │
-            ┌───────────┴───────────┐                  │
-      mustAbstain=true?       evidenceStatus=          │
-            │                 sufficient/partial        │
-            ▼                       │                  │
-      Return abstention      [5] Response Generator    │
-      with suggestions            (Groq LLM)           │
-                                   │                   │
-                            answer + citedSourceIds    │
-                                   │                   │
-                    [6] combined_confidence() scoring  │
-                                   │                   │
-                    [7] threshold_band() check         │
-                                   │                   │
-                    [8] Return StrictAnswerResponse    │
-```
-
-### 5.3 General Mode Query Pipeline
-
-```
-User question
-     │
-     ▼
-Pinecone query (top_k=3)
-     │
-     ▼
-LangChain RetrievalQA
-  (Groq Llama 3.3 70B)
-     │
-     ▼
-{response, sources}
+Pinecone (top_k=3) → LangChain RetrievalQA → {response, sources}
 ```
 
 ---
@@ -290,61 +257,65 @@ LangChain RetrievalQA
 ## 6. API Reference
 
 ### `POST /upload_pdfs/`
-Upload one or more PDFs to be embedded and stored in Pinecone.
+Multipart `files[]` + form `library` (string, optional → "default"). Embeds and upserts into that library's Pinecone namespace.
 
-**Request:** `multipart/form-data`
-- `files`: list of PDF files
-
-**Response:**
-```json
-{"message": "PDFs uploaded and indexed successfully"}
-```
-
----
+### `GET /libraries/`
+Returns `{ "libraries": ["default", "cardiology", ...] }`.
 
 ### `POST /ask/`
-General-mode question answering (RAG + LLM, no strict verification).
-
-**Request:** `application/x-www-form-urlencoded`
-- `question`: string
-
-**Response:**
-```json
-{
-  "response": "Answer text here",
-  "sources": ["source1.pdf", "source2.pdf"]
-}
-```
-
----
+Legacy general mode. Form: `question`.
 
 ### `POST /ask/strict/`
-Strict evidence-verified question answering.
+Form fields:
+- `question` — string (required)
+- `library` — string (optional, default `"default"`)
+- `use_web` — `true|false` (default `true`)
+- `history_json` — JSON-encoded list of `{role, content}` (optional)
 
-**Request:** `application/x-www-form-urlencoded`
-- `question`: string
+Response: `StrictAnswerResponse` (see schema below).
 
-**Response:** `StrictAnswerResponse`
+### `POST /ask/strict/stream/`
+Same inputs as `/ask/strict/`. Returns `text/event-stream` with these events:
+
+| Event | Payload |
+|---|---|
+| `meta` | `{ requestId, library }` |
+| `references` | `[Reference, ...]` (full list of candidates, all sources) |
+| `delta` | `{ text }` — repeated as tokens stream |
+| `done` | `{ answer, confidenceScore, status, references (used), verification }` |
+| `error` | `{ message }` |
+
+### Chat history endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /chat/save/` | Body `{session_id, title?, library?, messages: [...]}`. Writes `server/chat_history/<session_id>.json`. |
+| `GET /chat/list/` | Returns `[{session_id, title, library, updatedAt, messageCount}, ...]`. |
+| `GET /chat/{session_id}/` | Returns the full saved session. |
+| `DELETE /chat/{session_id}/` | Removes the session file. |
+
+### `StrictAnswerResponse`
+
 ```json
 {
   "requestId": "uuid",
   "mode": "strict",
-  "answer": "string",
+  "answer": "string with inline [source_id] citations",
   "confidenceScore": 75,
   "status": "answered | partial | insufficient_evidence | conflicting_evidence",
   "references": [
     {
-      "id": "pubmed_12345",
-      "title": "Paper title",
-      "source": "PubMed",
-      "sourceType": "peer_reviewed_journal",
-      "url": "https://pubmed.ncbi.nlm.nih.gov/12345/",
-      "confidenceScore": 80,
-      "publishedAt": "2023-04-15",
-      "retrievedAt": "2026-05-06T06:00:00Z",
-      "keyFindings": ["Abstract text..."],
+      "id": "pubmed_12345 | web_0_cdc_gov | openfda_metformin_0 | trial_NCT01234567 | internal_3",
+      "title": "string",
+      "source": "PubMed | cdc.gov | OpenFDA | ClinicalTrials.gov | Internal Library",
+      "sourceType": "peer_reviewed_journal | web | drug_label | clinical_trial | internal_pdf",
+      "url": "string",
+      "confidenceScore": 0,
+      "publishedAt": "YYYY-MM-DD",
+      "retrievedAt": "ISO-8601",
+      "keyFindings": ["..."],
       "usedInAnswer": true,
-      "credibilityTier": "A"
+      "credibilityTier": "A | B | C"
     }
   ],
   "verification": {
@@ -352,7 +323,7 @@ Strict evidence-verified question answering.
     "unsupportedClaimsRemoved": 0,
     "conflictsDetected": false,
     "internalRagConfidence": 0.72,
-    "externalEvidenceConfidence": 0.65
+    "externalEvidenceConfidence": 0.85
   },
   "ui": {
     "leftPanelTitle": "References",
@@ -367,146 +338,133 @@ Strict evidence-verified question answering.
 
 ### Model: Llama 3.3 70B Versatile (via Groq)
 
-**Why Groq?**
-- Sub-second inference latency (crucial for clinical use)
-- Free tier sufficient for development
-- Llama 3.3 70B is state-of-the-art open-weight model with strong medical reasoning
+- Sub-second inference, free tier sufficient for development.
+- Temperature **0** for both the synthesizer JSON and the streaming synthesizer.
 
-**Temperature Settings:**
-- General mode: default (balanced)
-- Verification agent: `temperature=0` (deterministic, no creativity)
-- Response generator: `temperature=0` (deterministic)
+### Agents
 
-### Agent Architecture (Strict Mode)
+| Agent | Role | Output | Constraint |
+|---|---|---|---|
+| **Synthesizer (JSON)** | Used by `/ask/strict/`. | JSON `{answer, status, citedSourceIds}` | Inline `[source_id]` citations required. |
+| **Streaming synthesizer** | Used by `/ask/strict/stream/`. | Plain markdown prose token stream. | Same citation rules. |
 
-Two separate LLM calls per query:
+### Prompt design
 
-| Agent | Role | Key Constraint |
-|---|---|---|
-| **Verification Agent** | Assess if evidence supports the question | Must NOT generate the answer |
-| **Response Generator** | Write clinical answer from verified claims only | Must NOT add knowledge beyond verified claims |
-
-### Prompt Design Philosophy
-
-- **Verification Agent** is permissive on typos and phrasing — focuses on evidence quality
-- **Response Generator** is strict — only uses verified claims, outputs caveats
-- Both agents output **JSON only** — no prose, no markdown in model output
-- Fail-closed: any parsing error → abstention
+- Synthesizer receives: question, last 6 conversation turns, internal chunks, external references (PubMed + web + FDA + trials).
+- Citation tag examples it knows about: `[pubmed_12345]`, `[web_0_cdc_gov]`, `[openfda_metformin_0]`, `[trial_NCT01234567]`, `[internal_3]`.
+- Sentences sourced from training-time medical knowledge are tagged `[general clinical knowledge]`.
+- Fail-closed: any parsing error → abstention sentence.
 
 ---
 
-## 8. Vector Database & Embeddings
+## 8. Vector Database, Libraries & Embeddings
 
-### Pinecone Configuration
+### Pinecone configuration
 
 | Parameter | Value |
 |---|---|
-| Index Name | `medicalindex` |
+| Index name | `medicalindex` |
 | Dimension | 768 |
-| Metric | `dotproduct` |
-| Cloud | AWS |
-| Region | `us-east-1` |
+| Metric | dotproduct |
+| Cloud | AWS `us-east-1` |
 | Tier | Serverless |
+| **Namespaces** | **One per library** (default = `"default"`) |
 
-### Embedding Model: Gemini Embedding 001
+### Libraries (no auth)
+
+- Library name is sanitized to `[a-z0-9_-]{1,48}` (lowercase). Anything else is converted to `_`.
+- Upload writes to the namespace; query reads from it. Different libraries cannot leak chunks into each other.
+- `list_libraries()` calls `index.describe_index_stats()` and returns namespace keys.
+- No multi-tenancy guarantees — anyone with deployment access can pick any library.
+
+### Embedding model
+
+`models/gemini-embedding-001` from Google Generative AI, 768-dim output. Same model for both ingestion and query.
+
+### Chunking
 
 | Parameter | Value |
 |---|---|
-| Model | `models/gemini-embedding-001` |
-| Output Dimensions | 768 |
-| Provider | Google Generative AI |
-
-### Chunking Strategy
-
-| Parameter | Value |
-|---|---|
-| Chunk Size | 500 tokens |
-| Chunk Overlap | 50 tokens |
+| Chunk size | 500 tokens |
+| Overlap | 50 tokens |
 | Splitter | `RecursiveCharacterTextSplitter` |
 
 ### Retrieval
 
-- **General mode:** `top_k=3`
-- **Strict mode:** `top_k=5` (configurable via `STRICT_TOP_K` env var)
+- General mode: `top_k=3`
+- Strict mode: `top_k=5` (`STRICT_TOP_K`)
 
 ---
 
 ## 9. Evidence Verification Layer
 
-### Verification Agent Output Schema
+Historic note: an earlier design used a separate Verification Agent that gated the Response Generator. v2 collapsed this into a single synthesizer that is given all evidence + history and instructed to cite or abstain. The result is faster, fewer failure modes, and easier streaming.
 
-```json
-{
-  "evidenceStatus": "sufficient | partial | insufficient | conflicting",
-  "verifiedClaims": [
-    {
-      "claim": "string",
-      "supportingSourceIds": ["string"],
-      "supportStrength": "strong | moderate | weak"
-    }
-  ],
-  "rejectedClaims": [
-    {"claim": "string", "reason": "unsupported | conflicting | not_applicable | too_old"}
-  ],
-  "conflictsDetected": false,
-  "mustAbstain": false,
-  "abstentionReason": null
-}
-```
+### Abstention rules
 
-### Abstention Rules
+The synthesizer abstains when:
 
-The system **abstains** (refuses to answer) when:
-1. Verification agent sets `mustAbstain: true`
-2. `evidenceStatus` is `"insufficient"` or `"conflicting"`
-3. Response generator returns `status` of `"insufficient_evidence"` or `"conflicting_evidence"`
-4. Generator cited sources but none match the reference list
-5. Final `combined_confidence` score < 50 (maps to `"abstain"` band)
+1. No internal chunks AND all external connectors returned 0 results.
+2. The output JSON sets `status` to `"insufficient_evidence"`.
+3. The output JSON parse fails (fail-closed).
+4. The streamed answer is empty.
 
-### Evidence Source Tiers
+When abstaining, the response answer is the canonical:
 
-| Tier | Source | Example |
-|---|---|---|
-| **A** | Peer-reviewed journals | PubMed articles |
-| **B** | Clinical documents | Internal PDFs (curated) |
-| **C** | General reference | Other sources |
+> `"I do not have sufficient verified evidence to answer this question."`
+
+### Evidence source tiers
+
+| Tier | Examples |
+|---|---|
+| **A** | PubMed peer-reviewed, OpenFDA drug labels, ClinicalTrials.gov, gov / WHO / major-journal websites |
+| **B** | Internal PDFs (curated), non-gov medical websites (Mayo, Cleveland Clinic, Medscape, …) |
+| **C** | Reserved for future open-web fallback |
 
 ---
 
 ## 10. Confidence Scoring System
 
-### Internal (RAG) Confidence
+### Internal (RAG) confidence
 
 ```python
 volume_factor = min(relevant_matches, 3) / 3.0
 aggregate = 0.7 * top_match_score + 0.3 * volume_factor
 ```
 
-- `relevant_matches`: number of matches scoring ≥ 0.55
+- `relevant_matches`: matches scoring ≥ 0.55
 - `answerable`: top ≥ 0.85 AND relevant ≥ 2
 
 ### Thresholds
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `INTERNAL_ANSWER_THRESHOLD` | 0.85 | Top match score for direct answer |
-| `INTERNAL_FALLBACK_THRESHOLD` | 0.50 | Trigger PubMed fallback below this |
+| `INTERNAL_ANSWER_THRESHOLD` | 0.85 | Direct-answer floor |
+| `INTERNAL_FALLBACK_THRESHOLD` | 0.50 | Always-run external below this |
 | `RELEVANT_MATCH_THRESHOLD` | 0.55 | Min score to count as "relevant" |
 
-### Combined Confidence
+### External score (heuristic)
 
-```python
-base = max(internal, external)
-if both > 0:
-    base = 0.5 * internal + 0.5 * external
-pct = int(round(base * 100))
-if conflicts: pct -= 15
-pct -= min(unsupported_claims, 5) * 4
+```
+external_score = min(0.6 + 0.05 * (n_refs - 1), 0.9)   # if any refs
+                 = 0.0                                    # otherwise
 ```
 
-### Threshold Bands
+### Combined confidence
 
-| Band | Score Range | Action |
+```
+base = max(internal, external)
+if both > 0: base = 0.5*internal + 0.5*external
+pct = round(base * 100)
+if conflicts: pct -= 15
+pct -= min(unsupported, 5) * 4
+```
+
+Plus a soft floor of 55 when we have *any* citations but the formula came out below 40.
+
+### Threshold bands
+
+| Band | Score | Action |
 |---|---|---|
 | `answer_full` | ≥ 85 | Full answer |
 | `answer_strong_only` | 70–84 | Strong claims only |
@@ -517,104 +475,238 @@ pct -= min(unsupported_claims, 5) * 4
 
 ## 11. External Connectors
 
-### PubMed E-utilities Connector
+All four run concurrently in a `ThreadPoolExecutor(max_workers=4)` inside `_gather_evidence`.
 
-**Endpoint:** `https://eutils.ncbi.nlm.nih.gov/entrez/eutils`
+### 11.1 PubMed (`connectors/pubmed.py`)
 
-**3-Step Retrieval:**
-1. `esearch.fcgi` — get PMIDs for query (sorted by relevance)
-2. `esummary.fcgi` — get title, journal, publication date
-3. `efetch.fcgi` — get full abstract text (XML parsing)
+3-step retrieval: `esearch` → `esummary` → `efetch` (abstracts).
 
-**Smart Query Rewriting:**
-- Step 1: Try original query
-- Step 2: Stopword-filtered simplified query
-- Step 3: LLM-rewritten PubMed-optimized query (Groq)
+**Smart query rewriting**
 
-**Rate Limiting:**
-- Without API key: 340ms sleep between calls (NCBI limit: 3 req/s)
-- With `NCBI_API_KEY`: 10 req/s allowed
+1. LLM-rewritten PubMed-optimized query (Groq).
+2. Fall back to the raw user query.
+3. Fall back to stopword-stripped simplified query.
 
-**Config:**
-- `STRICT_EXTERNAL_RETMAX=5` — max PubMed results per query
-- `NCBI_API_KEY` — optional, increases rate limit
-- `NCBI_CONTACT_EMAIL` — required by NCBI policy
+**Rate limits**
+
+- No key: 340ms sleep between calls (3 rps).
+- With `NCBI_API_KEY`: 10 rps.
+
+### 11.2 Tavily Web Search (`connectors/web_search.py`)
+
+POST `https://api.tavily.com/search` with `include_domains` set to a curated whitelist of ~35 medical domains:
+
+> who.int, nih.gov, ncbi.nlm.nih.gov, medlineplus.gov, cdc.gov, fda.gov, ema.europa.eu, nice.org.uk, cochrane.org, cochranelibrary.com, ahrq.gov, mayoclinic.org, clevelandclinic.org, hopkinsmedicine.org, uptodate.com, merckmanuals.com, aafp.org, ama-assn.org, acc.org, heart.org, diabetes.org, cancer.gov, cancer.org, rxlist.com, drugs.com, medscape.com, bmj.com, nejm.org, thelancet.com, jamanetwork.com, nature.com, sciencedirect.com, springer.com, wiley.com
+
+- Gov + top-journal hosts → Tier **A**, others → Tier **B**.
+- `sourceType: "web"`.
+- Reference IDs are `web_<index>_<host_with_underscores>`.
+
+### 11.3 OpenFDA (`connectors/openfda.py`)
+
+`GET https://api.fda.gov/drug/label.json?search=openfda.generic_name:<term>+openfda.brand_name:<term>`.
+
+- Heuristically extracts candidate drug names from the question (alphabetic tokens ≥ 4 chars, stopword-filtered).
+- Tries up to 3 candidates; first hit wins.
+- Surfaces up to 4 of: indications, dosage, contraindications, warnings, adverse reactions, interactions, mechanism of action.
+- Tier **A**, `sourceType: "drug_label"`.
+- Reference IDs are `openfda_<term>_<i>`.
+
+### 11.4 ClinicalTrials.gov v2 (`connectors/clinicaltrials.py`)
+
+`GET https://clinicaltrials.gov/api/v2/studies` with `query.term=<question>` and field-filter.
+
+- Surfaces `briefSummary`, status, phase, conditions, lead sponsor, start date.
+- Tier **A**, `sourceType: "clinical_trial"`.
+- Reference IDs are `trial_<NCTId>`.
 
 ---
 
-## 12. Frontend (Streamlit Client)
+## 12. Streaming Pipeline (SSE)
+
+### Server side
+
+`/ask/strict/stream/` returns `StreamingResponse(event_gen(), media_type="text/event-stream")`.
+
+`stream_answer_strict()` yields dicts which the route serializes as SSE frames:
+
+```
+event: <name>
+data: <json>
+
+```
+
+Pipeline:
+
+1. Run evidence-gathering synchronously (so the UI can show references early).
+2. Emit `meta` and `references` immediately.
+3. Call `_llm().stream([...])` and yield each `delta`.
+4. After the stream ends, scan the collected text for `[source_id]` brackets to build the "used" reference list.
+5. Emit `done` with the assembled answer, status, confidence, and used references.
+
+### Client side
+
+`utils/api.py:stream_strict()` consumes the SSE stream line-by-line, accumulating `data:` lines until a blank line, then yielding `{event, data}` dicts.
+
+`chatUI.py` drives the UI:
+
+- On `references` → render the right-hand panel immediately.
+- On the first `delta` → flip status pill to "Streaming…".
+- On every `delta` → append to the chat bubble.
+- On `done` → render the final status pill + confidence, save the message into `st.session_state.messages`, persist via `/chat/save/`.
+
+---
+
+## 13. Conversation Memory
+
+- The client sends the **last 6 turns** of `{role, content}` with each query.
+- `verification.py:_history_payload()` trims each turn to ≤ 1500 chars to keep the context bounded.
+- Both the JSON synthesizer and the streaming synthesizer receive the history and are explicitly told to use it for resolving pronouns ("that drug", "it", follow-up questions).
+- History is *not* embedded into Pinecone — it lives only in the LLM prompt.
+
+---
+
+## 14. Chat History Persistence
+
+### Storage
+
+- One JSON file per session at `server/chat_history/<session_id>.json` (override with `CHAT_HISTORY_DIR`).
+- `session_id` is a client-generated UUID hex.
+- File shape:
+
+```json
+{
+  "session_id": "abc...",
+  "title": "First user question, trimmed to 60 chars",
+  "library": "cardiology",
+  "updatedAt": "2026-05-23T03:20:03Z",
+  "messages": [
+    { "role": "user", "content": "..." },
+    { "role": "assistant", "content": "...", "status": "answered",
+      "confidenceScore": 87, "references": [ ... ] }
+  ]
+}
+```
+
+### Endpoints
+
+- `POST /chat/save/` — body validated with Pydantic. Sanitizes `session_id` against `^[A-Za-z0-9_-]{1,64}$`.
+- `GET /chat/list/` — returns sessions sorted by `updatedAt` desc.
+- `GET /chat/{session_id}/` — full session.
+- `DELETE /chat/{session_id}/` — removes the file.
+
+### UI behavior
+
+- The Streamlit sidebar lists recent sessions. Click to load (replays prior assistant references too). 🗑 deletes.
+- Every assistant turn auto-saves the entire session, so reload is lossless.
+
+---
+
+## 15. Frontend (Streamlit Client)
 
 ### Layout
 
 ```
-┌─────────────────────────────────────────────────┐
-│  🩺 Medical Assistant Chatbot                   │
-│  [Strict evidence mode toggle] [?]              │
-├───────────────────────────┬─────────────────────┤
-│  CHAT AREA (2/3 width)    │  REFERENCES (1/3)   │
-│                           │                     │
-│  [user] tell me about...  │  [1] Paper Title    │
-│  [assistant] ●Answered    │      PubMed · 2023  │
-│              Confidence:  │      Open ↗          │
-│              75/100       │      Abstract...     │
-│              Answer text  │                     │
-│              [1] PubMed   │  [2] Paper Title    │
-│                           │      ...            │
-│  [Type your question...]  │                     │
-└───────────────────────────┴─────────────────────┘
+┌─────────────────────────── 🩺 MediBot ──────────────────────────────┐
+│  Sidebar                                                             │
+│  ┌────────────────────────┐                                          │
+│  │ 📚 Library: cardiology │                                          │
+│  │ [Active library select]│                                          │
+│  │ ➕ Create new          │                                          │
+│  │ ─────────────          │                                          │
+│  │ 📄 Upload PDFs         │                                          │
+│  │ ─────────────          │                                          │
+│  │ 💬 Conversations       │                                          │
+│  │ ➕ New chat            │                                          │
+│  │ 📝 Old chat A     🗑   │                                          │
+│  │ 📝 Old chat B     🗑   │                                          │
+│  │ ─────────────          │                                          │
+│  │ ⬇️ Download .txt/.json │                                          │
+│  └────────────────────────┘                                          │
+│                                                                       │
+│  Main                                                                 │
+│  Chat with your assistant                       [🌐 Web search] 📚 cardiology│
+│  ┌──────────────────────┬─────────────────────────────────────────┐ │
+│  │  Chat (2/3)          │  Sources (1/3)                          │ │
+│  │  user: ...           │  [1] PubMed · Tier A · 2024-...         │ │
+│  │  assistant: streaming│  [2] Web · cdc.gov · Tier A             │ │
+│  │   ● Answered  87/100 │  [3] FDA · Tier A (OpenFDA)             │ │
+│  │   answer text with   │  [4] Trial · NCT12345 · Tier A          │ │
+│  │   inline citations   │  [5] Internal · Tier B                  │ │
+│  └──────────────────────┴─────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-### Status Pills
+### Status pills
 
 | Status | Color | Meaning |
 |---|---|---|
 | `Answered` | Green `#16a34a` | Full evidence-backed answer |
 | `Partial` | Amber `#d97706` | Partial evidence answer |
-| `No verified answer` | Gray `#6b7280` | Abstained, suggestions shown |
-| `Conflicting evidence` | Red `#dc2626` | Sources contradict each other |
+| `No verified answer` | Gray `#6b7280` | Abstained |
+| `Conflicting evidence` | Red `#dc2626` | Sources contradict |
+| `Searching sources…` | Slate `#475569` | Pre-stream evidence gathering |
+| `Streaming…` | Sky `#0ea5e9` | LLM is generating tokens |
+
+### Source badges
+
+| Source type | Color | Label |
+|---|---|---|
+| `peer_reviewed_journal` | `#0ea5e9` | PubMed |
+| `web` | `#10b981` | Web |
+| `internal_pdf` | `#a78bfa` | Internal |
+| `drug_label` | `#f59e0b` | FDA |
+| `clinical_trial` | `#ec4899` | Trial |
 
 ---
 
-## 13. Security & Safety Design
+## 16. Security & Safety Design
 
-### Medical Safety
+### Medical safety
 
-- **Fail-closed** architecture — uncertain = abstain, never guess
-- **No diagnosis or prescriptions** — system explicitly forbids diagnostic claims
-- **Clinical caveats** appended to every answer
-- **Source citations mandatory** — every claim must be linked to a source
-- **Strict mode by default** in the UI
+- **Fail-closed** architecture — any error returns the abstention sentence.
+- **No diagnostic claims, no prescriptions** — synthesizer prompt forbids inventing dosages, statistics, or trial outcomes.
+- **Inline citations mandatory**; non-cited sentences must be tagged `[general clinical knowledge]`.
+- **Strict mode** is the default UI path.
 
-### API Security
+### API security
 
-- CORS configured (currently `*` for dev — restrict in production)
-- Environment variables for all secrets (never in code)
-- Exception middleware catches and logs all errors without leaking internals
+- CORS currently `*` (dev). Restrict in production.
+- All secrets via `.env`; never in code.
+- Exception middleware catches and logs without leaking internals.
+- Session IDs are validated against `^[A-Za-z0-9_-]{1,64}$` before touching the filesystem (avoids path traversal).
 
-### Data Privacy
+### Data privacy
 
-- Uploaded PDFs stored locally in `server/uploaded_docs/`
-- No patient data should ever be uploaded (stated in documentation)
+- Uploaded PDFs stored at `server/uploaded_docs/`.
+- Chat history at `server/chat_history/`.
+- Patient data must never be uploaded.
 
 ---
 
-## 14. Environment & Configuration
+## 17. Environment & Configuration
 
-### Server `.env` Variables
+### Server `.env`
 
 | Variable | Required | Description |
 |---|---|---|
-| `GROQ_API_KEY` | ✅ | Groq LLM inference API key |
-| `GOOGLE_API_KEY` | ✅ | Google Generative AI (for embeddings) |
-| `PINECONE_API_KEY` | ✅ | Pinecone vector database |
-| `PINECONE_INDEX_NAME` | ✅ | Pinecone index name (e.g. `medicalindex`) |
-| `GROQ_MODEL` | Optional | LLM model name (default: `llama-3.3-70b-versatile`) |
-| `STRICT_TOP_K` | Optional | Pinecone top-k for strict mode (default: `5`) |
-| `STRICT_EXTERNAL_RETMAX` | Optional | PubMed max results (default: `5`) |
-| `NCBI_API_KEY` | Optional | NCBI API key (higher rate limits) |
-| `NCBI_CONTACT_EMAIL` | Optional | Contact email for NCBI (default: `noreply@example.com`) |
+| `GROQ_API_KEY` | ✅ | Groq LLM inference |
+| `GOOGLE_API_KEY` | ✅ | Google Generative AI (embeddings) |
+| `PINECONE_API_KEY` | ✅ | Pinecone vector DB |
+| `PINECONE_INDEX_NAME` | ✅ | e.g. `medicalindex` |
+| `TAVILY_API_KEY` | ✅ for web search | Tavily |
+| `GROQ_MODEL` | optional | default `llama-3.3-70b-versatile` |
+| `STRICT_TOP_K` | optional | Pinecone top-k (default `5`) |
+| `STRICT_EXTERNAL_RETMAX` | optional | PubMed max results (default `5`) |
+| `STRICT_WEB_RETMAX` | optional | Web max results (default `5`) |
+| `STRICT_FDA_RETMAX` | optional | OpenFDA max (default `3`) |
+| `STRICT_TRIALS_RETMAX` | optional | Trials max (default `3`) |
+| `NCBI_API_KEY` | optional | PubMed 10 rps |
+| `NCBI_CONTACT_EMAIL` | optional | NCBI policy |
+| `OPENFDA_API_KEY` | optional | Higher OpenFDA rate limit |
+| `CHAT_HISTORY_DIR` | optional | Override chat-history dir |
 
-### Client Config (`client/config.py`)
+### Client (`client/config.py`)
 
 | Variable | Default | Description |
 |---|---|---|
@@ -622,36 +714,36 @@ pct -= min(unsupported_claims, 5) * 4
 
 ---
 
-## 15. Deployment Architecture
+## 18. Deployment Architecture
 
-### Local Development
+### Local development
 
 ```bash
-# Terminal 1 — Start backend
+# Terminal 1 — backend
 cd server
 uvicorn main:app --reload --port 8000
 
-# Terminal 2 — Start frontend
+# Terminal 2 — frontend
 cd client
 streamlit run app.py
 ```
 
-### Production (Recommended)
+### Production (recommended)
 
 ```
 [Nginx Reverse Proxy]
      │
      ├──▶ [Streamlit] :8501  (client)
      │
-     └──▶ [Uvicorn/Gunicorn] :8000  (FastAPI server)
+     └──▶ [Uvicorn / Gunicorn] :8000  (FastAPI server)
 
-[Pinecone Serverless] ← managed cloud service
-[Groq Cloud API]      ← managed LLM inference
+[Pinecone Serverless] ← managed cloud
+[Groq Cloud API]      ← managed LLM
 [Google AI API]       ← managed embeddings
-[PubMed NCBI API]     ← public, free
+[Tavily / OpenFDA / ClinicalTrials.gov / NCBI] ← public APIs
 ```
 
-### Docker (Planned)
+### Docker (planned)
 
 ```
 docker-compose.yml
@@ -661,134 +753,57 @@ docker-compose.yml
 
 ---
 
-## 16. Future Integrations
+## 19. Future Integrations
 
-> These are planned integrations that are currently being integrated into the codebase.
+### 19.1 UMLS (Unified Medical Language System)
 
-### 16.1 OpenFDA Drug Database Connector
+Medical concept normalization and synonym expansion. Example: "heart attack" → `["myocardial infarction", "MI", "AMI"]` before retrieval. Dramatically improves recall.
 
-**Purpose:** Real-time drug information, interactions, and FDA approval data.
+### 19.2 Hybrid Reranker
 
-**Implementation:**
-```python
-# server/modules/connectors/openfda.py
-# Endpoint: https://api.fda.gov/drug/
-# Searches: drug labels, adverse events, recalls
-```
+ColBERT or cross-encoder rerank on top of Pinecone ANN: fast top-20 from Pinecone, then accurate top-5 from `cross-encoder/ms-marco-MiniLM-L-6-v2` or Cohere Rerank.
 
-**Integration Point:** Falls back to OpenFDA when PubMed results are insufficient for drug-specific questions.
+### 19.3 Semantic Scholar API
 
----
+Extends literature coverage to computer science and biomedical preprints not yet in PubMed.
 
-### 16.2 WHO ICD-11 API Connector
+### 19.4 MedlinePlus Connect
 
-**Purpose:** Standardized disease classification and coding.
+Patient-friendly medical info from the US National Library of Medicine — useful for a patient-facing mode.
 
-**Endpoint:** `https://icd.who.int/icdapi`
+### 19.5 Authentication & Multi-Tenancy
 
-**Use Case:** Auto-classify diseases in questions, enrich answers with ICD-11 codes, ensure terminology consistency.
+Doctor accounts, session management, per-institution library scoping. Stack: FastAPI + OAuth2 + JWT + PostgreSQL.
 
----
+### 19.6 Observability Stack
 
-### 16.3 ClinicalTrials.gov Connector
-
-**Purpose:** Retrieve ongoing and completed clinical trials relevant to the question.
-
-**Endpoint:** `https://clinicaltrials.gov/api/v2/studies`
-
-**Integration:** Adds `sourceType: "clinical_trial"` references alongside PubMed results.
-
----
-
-### 16.4 Semantic Scholar API
-
-**Purpose:** Academic literature beyond PubMed — computer science, biomedical preprints.
-
-**Endpoint:** `https://api.semanticscholar.org/graph/v1/`
-
-**Why:** Captures cutting-edge research not yet indexed in PubMed.
-
----
-
-### 16.5 MedlinePlus Connect
-
-**Purpose:** Patient-friendly medical information from the US National Library of Medicine.
-
-**Endpoint:** `https://connect.medlineplus.gov/`
-
-**Use Case:** Non-strict mode answers for patient-facing queries.
-
----
-
-### 16.6 UMLS (Unified Medical Language System)
-
-**Purpose:** Medical concept normalization and synonym expansion.
-
-**Use Case:** Expand query "heart attack" → `["myocardial infarction", "MI", "AMI"]` before PubMed search, dramatically improving recall.
-
-**Auth:** UMLS API key (free registration at uts.nlm.nih.gov)
-
----
-
-### 16.7 Hybrid Reranker (ColBERT / Cross-Encoder)
-
-**Purpose:** Improve RAG retrieval relevance beyond cosine similarity.
-
-**Implementation:**
-- First pass: Pinecone ANN retrieval (fast, top 20)
-- Second pass: Cross-encoder reranking (accurate, top 5)
-
-**Models:** `cross-encoder/ms-marco-MiniLM-L-6-v2` or Cohere Rerank API.
-
----
-
-### 16.8 Streaming Responses (SSE)
-
-**Purpose:** Stream the LLM answer token-by-token to the UI for better UX.
-
-**Implementation:** FastAPI `StreamingResponse` + Streamlit `st.write_stream()`.
-
----
-
-### 16.9 Authentication & Multi-Tenancy
-
-**Purpose:** Doctor accounts, session management, per-institution PDF libraries.
-
-**Stack:** FastAPI + OAuth2 + JWT tokens + PostgreSQL (user/session storage).
-
----
-
-### 16.10 Observability Stack
-
-**Purpose:** Production monitoring of LLM calls, latency, error rates.
-
-**Stack:**
 - **LangSmith** — LLM call tracing and evaluation
-- **Prometheus + Grafana** — API metrics dashboards
+- **Prometheus + Grafana** — API metrics
 - **Sentry** — Error tracking and alerting
 
+### 19.7 Docker Compose deployment
+
+A `docker-compose.yml` for one-command local deploy.
+
 ---
 
-## 17. Known Issues & Fixes
+## 20. Known Issues & Fixes
 
-### Issue: Strict mode returns "I do not have sufficient verified evidence" for well-known medical questions
+### Issue (resolved): Strict mode used to return "I do not have sufficient verified evidence" for well-known medical questions.
 
-**Root Cause (Multi-layered):**
+**Root cause** (multi-layered):
 
-1. `verification.py` — `mustAbstain` defaults to `True` in the prompt template JSON shape, so if the LLM output is ambiguous, it always abstains.
-2. `strict_orchestrator.py` line 162 — `bool(verification.get("mustAbstain", True))` — Python default is `True`, meaning any missing key causes abstention.
-3. The Verification Agent is not being told to use its **general medical knowledge** to assess whether evidence is "sufficient" — it overly restricts to only the retrieved chunks.
-4. `threshold_band()` — anything below 50% combined confidence returns `"abstain"`, and combined confidence is penalized aggressively.
+1. `verification.py` had a separate Verification Agent whose JSON shape defaulted `mustAbstain: true`.
+2. `strict_orchestrator.py` used `verification.get("mustAbstain", True)` so any missing key triggered abstention.
+3. The Verification Agent was instructed to only use retrieved chunks, ignoring well-established medical knowledge.
+4. `threshold_band()` mapped anything < 50% to "abstain".
 
-**Fix Applied:**
-- Changed `mustAbstain` default in orchestrator from `True` → `False`
-- Updated Verification Agent prompt to treat peer-reviewed PubMed abstracts as independently sufficient
-- Updated Response Generator to use general medical knowledge as a fallback when `evidenceStatus` is `"partial"` and the question is about well-established medical facts
-- Lowered abstention threshold to allow `"answer_partial_or_abstain"` band to actually answer
+**v2 fix** (current state):
 
-**Files Changed:**
-- `server/modules/strict_orchestrator.py`
-- `server/modules/verification.py`
+- The separate Verification Agent was removed. A single synthesizer is given all evidence + history and instructed to cite or abstain.
+- The synthesizer prompt explicitly allows general clinical knowledge for mainstream facts, tagged `[general clinical knowledge]`.
+- A soft confidence floor of 55 is applied whenever any citation is present, so the band doesn't collapse to "abstain" for low-but-non-empty evidence.
+- Streaming variant uses plain-prose output (no JSON parsing) so partial responses always render.
 
 ---
 
