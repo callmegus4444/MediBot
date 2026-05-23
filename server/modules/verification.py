@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from langchain_groq import ChatGroq
 
@@ -243,10 +243,13 @@ Output ONLY valid JSON, no prose, no markdown fences."""
 SYNTH_USER_TMPL = """Doctor question:
 {question}
 
+Recent conversation (most recent last; use it to resolve pronouns like "it", "this drug", "that condition"):
+{history_json}
+
 Internal document chunks (uploaded PDFs):
 {internal_json}
 
-External peer-reviewed sources (PubMed):
+External sources (PubMed peer-reviewed abstracts, trusted medical websites such as WHO/CDC/FDA/NIH/Mayo Clinic/NEJM/BMJ, FDA drug labels via OpenFDA, and ClinicalTrials.gov studies — each item lists its `source`, `sourceType`, and `url`):
 {external_json}
 
 Return this exact JSON shape:
@@ -257,15 +260,62 @@ Return this exact JSON shape:
 }}"""
 
 
+SYNTH_STREAM_SYSTEM = """You are MediBot, a clinical assistant for doctors.
+
+You will be given a doctor's question, recent conversation history, and source materials (PubMed abstracts, trusted medical websites, FDA drug labels, clinical trials, and uploaded PDFs).
+
+Write a concise, professional clinical answer in plain prose (not JSON).
+
+Rules:
+- Cite supporting sources inline using their `id` field in square brackets, e.g. [pubmed_12345], [web_0_cdc_gov], [openfda_metformin_0], [trial_NCT01234567], [internal_3]. Place the citation right after the claim it supports.
+- For well-established medical facts (common disease symptoms, standard drug classes, basic physiology, diagnostic criteria), you MAY use general clinical knowledge — mark such sentences with the suffix [general clinical knowledge].
+- Combine cited specifics with general knowledge fluently. Do not invent dosages, statistics, or trial outcomes that are not in the sources.
+- Use the conversation history to resolve pronouns and follow-up questions.
+- Output plain markdown prose. Do NOT output JSON, code fences, or headers."""
+
+
+SYNTH_STREAM_USER_TMPL = """Doctor question:
+{question}
+
+Recent conversation:
+{history_json}
+
+Internal document chunks:
+{internal_json}
+
+External sources:
+{external_json}
+
+Write the answer now."""
+
+
+def _history_payload(history: Optional[List[Dict[str, str]]], limit: int = 6) -> List[Dict[str, str]]:
+    if not history:
+        return []
+    cleaned: List[Dict[str, str]] = []
+    for turn in history[-limit:]:
+        if not isinstance(turn, dict):
+            continue
+        role = str(turn.get("role") or "user")
+        content = str(turn.get("content") or "").strip()
+        if not content:
+            continue
+        # Trim long assistant messages so the context stays manageable.
+        cleaned.append({"role": role, "content": content[:1500]})
+    return cleaned
+
+
 def synthesize_from_sources(
     question: str,
     *,
     internal_chunks: List[dict],
     references: List[Reference],
+    history: Optional[List[Dict[str, str]]] = None,
 ) -> Tuple[str, str, List[str]]:
     """One-shot answer synthesis from sources. Returns (answer, status, citedSourceIds)."""
     user_msg = SYNTH_USER_TMPL.format(
         question=question,
+        history_json=json.dumps(_history_payload(history), ensure_ascii=False),
         internal_json=json.dumps(_internal_payload(internal_chunks), ensure_ascii=False),
         external_json=json.dumps(_external_payload(references), ensure_ascii=False),
     )
@@ -300,3 +350,32 @@ def synthesize_from_sources(
         return ABSTENTION_SENTENCE, "insufficient_evidence", []
 
     return answer, status, [str(c) for c in cited]
+
+
+def stream_synthesize_from_sources(
+    question: str,
+    *,
+    internal_chunks: List[dict],
+    references: List[Reference],
+    history: Optional[List[Dict[str, str]]] = None,
+) -> Iterable[str]:
+    """Stream the synthesizer answer as plain prose token chunks."""
+    user_msg = SYNTH_STREAM_USER_TMPL.format(
+        question=question,
+        history_json=json.dumps(_history_payload(history), ensure_ascii=False),
+        internal_json=json.dumps(_internal_payload(internal_chunks), ensure_ascii=False),
+        external_json=json.dumps(_external_payload(references), ensure_ascii=False),
+    )
+    try:
+        for chunk in _llm().stream(
+            [
+                {"role": "system", "content": SYNTH_STREAM_SYSTEM},
+                {"role": "user", "content": user_msg},
+            ]
+        ):
+            text = getattr(chunk, "content", "") or ""
+            if text:
+                yield text
+    except Exception as exc:
+        logger.warning(f"Stream synthesizer LLM call failed: {exc}")
+        return

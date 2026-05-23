@@ -4,6 +4,7 @@ from middlewares.exception_handlers import catch_exception_middleware
 from routes.upload_pdfs import router as upload_router
 from routes.ask_question import router as ask_router
 from routes.ask_strict import router as ask_strict_router
+from routes.chat_history import router as chat_history_router
 
 
 
@@ -31,3 +32,5 @@ app.include_router(upload_router)
 app.include_router(ask_router)
 # 3. strict-mode evidence-grounded answering
 app.include_router(ask_strict_router)
+# 4. chat history persistence
+app.include_router(chat_history_router)

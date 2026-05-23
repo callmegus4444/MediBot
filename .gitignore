@@ -2,3 +2,7 @@
 /server/.env
 __pycache__
 test.py
+.claude/
+*.log
+*.tmp.*
+/server/chat_history/

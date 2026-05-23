@@ -1,6 +1,26 @@
+import json
 import streamlit as st
 
+
 def render_history_download():
-    if st.session_state.get("message"):
-        chat_text="\n\n".join([f"{m['role'].upper()}: {m['content']}" for m in st.session_state.messages])
-        st.download_button("Download Chat History",chat_text,file_name="chat_history.txt",mime="text/plain")
+    messages = st.session_state.get("messages") or []
+    if not messages:
+        return
+    st.sidebar.divider()
+    txt = "\n\n".join(
+        f"{m.get('role','user').upper()}: {m.get('content','')}" for m in messages
+    )
+    st.sidebar.download_button(
+        "⬇️ Download chat (.txt)",
+        data=txt,
+        file_name="chat_history.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
+    st.sidebar.download_button(
+        "⬇️ Download chat (.json)",
+        data=json.dumps(messages, ensure_ascii=False, indent=2),
+        file_name="chat_history.json",
+        mime="application/json",
+        use_container_width=True,
+    )
