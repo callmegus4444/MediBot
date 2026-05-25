@@ -28,6 +28,7 @@ from modules.confidence import (
 )
 from modules.connectors import clinicaltrials, openfda, pubmed, web_search
 from modules.load_vectorstore import sanitize_library
+from modules.medical_nlp import normalize_query
 from modules.verification import (
     stream_synthesize_from_sources,
     synthesize_from_sources,
@@ -132,8 +133,13 @@ def _gather_evidence(
 ) -> Dict[str, Any]:
     """Run all retrieval + connectors. Pure data fetch; no LLM yet."""
     namespace = sanitize_library(library)
+
+    norm = normalize_query(question)
+    retrieval_q = norm.get("normalized") or question
+    medical_entities = norm.get("entities") or []
+
     try:
-        matches, _ = _retrieve_internal(question, namespace)
+        matches, _ = _retrieve_internal(retrieval_q, namespace)
     except Exception as exc:
         logger.exception(f"Internal retrieval failed: {exc}")
         matches = []
@@ -148,10 +154,10 @@ def _gather_evidence(
     trial_refs: List[Reference] = []
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        f_pubmed = pool.submit(pubmed.search, question, retmax=EXTERNAL_RETMAX)
-        f_web = pool.submit(web_search.search, question, retmax=WEB_RETMAX) if use_web else None
-        f_fda = pool.submit(openfda.search, question, retmax=FDA_RETMAX)
-        f_trials = pool.submit(clinicaltrials.search, question, retmax=TRIALS_RETMAX)
+        f_pubmed = pool.submit(pubmed.search, retrieval_q, retmax=EXTERNAL_RETMAX)
+        f_web = pool.submit(web_search.search, retrieval_q, retmax=WEB_RETMAX) if use_web else None
+        f_fda = pool.submit(openfda.search, retrieval_q, retmax=FDA_RETMAX)
+        f_trials = pool.submit(clinicaltrials.search, retrieval_q, retmax=TRIALS_RETMAX)
 
         for label, fut in [
             ("pubmed", f_pubmed),
@@ -193,6 +199,8 @@ def _gather_evidence(
         "all_refs": internal_refs + external_refs,
         "internal_conf": internal_conf,
         "external_score": external_score,
+        "normalized_question": retrieval_q,
+        "medical_entities": medical_entities,
     }
 
 

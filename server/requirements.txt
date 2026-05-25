@@ -32,6 +32,13 @@ tqdm
 # Logging (optional but recommended)
 loguru
 
+# Medical NLP (scispaCy + UMLS EntityLinker)
+# The biomedical model wheel must be installed separately, e.g.:
+#   uv pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_lg-0.5.4.tar.gz
+# Override at runtime with SCISPACY_MODEL / SCISPACY_LINKER / SCISPACY_LINKER_THRESHOLD.
+spacy
+scispacy
+
 
 
 #  uv pip install -r requirements.txt
