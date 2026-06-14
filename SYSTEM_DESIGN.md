@@ -1,6 +1,6 @@
 # MediBot — Comprehensive System Design Documentation
 
-> **Version:** 2.0.0 | **Last Updated:** May 2026 | **Status:** Active Development
+> **Version:** 2.1.0 | **Last Updated:** June 2026 | **Status:** Active Development
 
 ---
 
@@ -43,6 +43,7 @@
 
 ### Who It's For
 
+
 | Audience | Use Case |
 |---|---|
 | Doctors / Clinicians | Quick reference during consultations |
@@ -76,7 +77,7 @@
 │      ┌───────▼──────┐    ┌──────────▼──────────┐       │
 │      │ General Mode │    │   Strict Orchestrator│       │
 │      │   (llm.py)   │    │(strict_orchestrator) │       │
-│      └───────┬──────┘    └──────────┬──────────┘       │
+│      └───────┬──────┘    └──────  ────┬──────────┘       │
 └──────────────┼───────────────────────┼──────────────────┘
                │                       │
    ┌───────────▼──────┐    ┌───────────▼──────────────┐
@@ -106,6 +107,7 @@
 | LLM orchestration | LangChain | Chain management |
 | LLM provider | Groq (`langchain-groq`) | Ultra-fast inference |
 | LLM model | Llama 3.3 70B Versatile | Synthesis, drafting |
+| Medical NLP | scispaCy + `en_core_sci_lg` + UMLS EntityLinker | Query term normalization to UMLS-canonical phrasing |
 | Embeddings | Google Gemini Embedding 001 | 768-dim |
 | Vector store | Pinecone Serverless | Semantic search, per-library namespaces |
 | Validation | Pydantic v2 | Schemas |
@@ -154,10 +156,13 @@
 | `server/routes/ask_question.py` | `POST /ask/` (legacy general mode). |
 | `server/routes/ask_strict.py` | `POST /ask/strict/` and `POST /ask/strict/stream/`. |
 | `server/routes/chat_history.py` | Session persistence — save / list / load / delete. |
-| `server/modules/strict_orchestrator.py` | Multi-source fan-out + synthesis. Exposes `answer_strict` and `stream_answer_strict`. |
+| `server/modules/strict_orchestrator.py` | Multi-source fan-out + synthesis. Exposes `answer_strict` and `stream_answer_strict`. Normalizes the query via `medical_nlp` before retrieval. |
+| `server/modules/medical_nlp.py` | scispaCy + `en_core_sci_lg` + UMLS EntityLinker. `normalize_query()` rewrites medical terms in the doctor's wording to UMLS-canonical phrasing before retrieval/connectors. Fails open if scispaCy/model is absent. |
 | `server/modules/verification.py` | Synthesizer (one-shot JSON) and streaming synthesizer (plain prose). |
 | `server/modules/confidence.py` | Internal RAG and combined-confidence scoring. |
 | `server/modules/llm.py` | Legacy general-mode RetrievalQA chain. |
+| `server/modules/pdf_handlers.py` | `save_uploaded_files()` — writes uploaded `UploadFile`s to `./uploaded_docs/` before ingestion. |
+| `server/modules/query_handlers.py` | `query_chain()` — legacy helper that runs a LangChain chain and returns `{response, sources}` (general mode). |
 | `server/modules/load_vectorstore.py` | PDF ingestion → embeddings → Pinecone upsert per library namespace. `sanitize_library()` and `list_libraries()`. |
 | `server/modules/connectors/pubmed.py` | NCBI E-utilities with LLM query rewriting + fallbacks. |
 | `server/modules/connectors/web_search.py` | Tavily search restricted to a whitelist of medical domains. |
@@ -207,6 +212,11 @@ Metadata: {text, source=filename, page, library}
 User question  +  library  +  use_web  +  history (last 6 turns)
      │
      ▼
+[0] Medical-term normalization (scispaCy + UMLS)
+        rewrites doctor's wording → UMLS-canonical query (fails open)
+        the normalized query feeds BOTH retrieval and all connectors
+     │
+     ▼
 [1] Pinecone semantic search   (top_k=5, namespace=library)
      │
      ▼
@@ -218,7 +228,7 @@ User question  +  library  +  use_web  +  history (last 6 turns)
      ▼
 [4] Synthesizer (Groq Llama 3.3 70B, temperature=0)
         Input: question, history, internal_chunks, all references
-        Output JSON: {answer with inline [source_id], status, citedSourceIds}
+        Output JSON: {answer with inline markdown links to source URLs, status, citedSourceIds}
      │
      ▼
 [5] combined_confidence() + status mapping
@@ -226,6 +236,71 @@ User question  +  library  +  use_web  +  history (last 6 turns)
      ▼
 [6] Return StrictAnswerResponse
 ```
+
+### 5.2.1 Worked example — one query end to end
+
+Say a doctor types this into the `cardiology` library with web search on:
+
+> **"wat is the first line treatmnt for hart failure with reduced EF"**
+
+**Step [0] — Medical-term normalization (`medical_nlp.normalize_query`)**
+
+scispaCy spots the clinical spans, the UMLS EntityLinker resolves them above the 0.7 threshold, and the noisy wording is rewritten:
+
+```text
+original   : "wat is the first line treatmnt for hart failure with reduced EF"
+normalized : "wat is the first line treatmnt for Heart Failure with reduced Ejection Fraction"
+entities   : [
+  {"text": "hart failure", "canonical": "Heart Failure",            "cui": "C0018801", "score": 0.91},
+  {"text": "reduced EF",    "canonical": "Ejection Fraction, reduced","cui": "C4554564", "score": 0.78}
+]
+```
+
+> The typos `wat`/`treatmnt` are left alone (not medical entities); only the clinical terms are canonicalized. This single normalized string is what feeds **both** Pinecone and **all four** connectors — so a misspelled "hart failure" still hits the right PubMed/PDF records.
+
+**Step [1]–[2] — Internal retrieval + confidence**
+
+Pinecone (`namespace="cardiology"`, `top_k=5`) returns 5 chunks. Top score `0.82`, three chunks ≥ `0.55`:
+
+```text
+top_match_score = 0.82
+relevant_matches = 3            (scores 0.82, 0.71, 0.58)
+volume_factor    = min(3,3)/3 = 1.0
+internal_conf    = 0.7*0.82 + 0.3*1.0 = 0.874
+```
+
+**Step [3] — Parallel connector fan-out**
+
+```text
+PubMed   → 5 abstracts (e.g. pubmed_37458921 "ARNI vs ACEi in HFrEF")
+Web      → 3 hits       (web_0_aha_journals_org, web_1_nice_org_uk, ...)
+OpenFDA  → 1 label      (openfda_sacubitril_0 — Entresto indications/dosage)
+Trials   → 2 studies    (trial_NCT01035255 PARADIGM-HF, ...)
+external_refs = 11
+external_score = min(0.6 + 0.05*(11-1), 0.9) = 0.9   (capped)
+```
+
+**Step [4] — Synthesizer (Groq Llama 3.3 70B)**
+
+Returns prose with inline citations:
+
+> "First-line therapy for HFrEF is guideline-directed medical therapy: an ARNI (sacubitril/valsartan) is preferred over an ACE inhibitor ([PubMed](https://pubmed.ncbi.nlm.nih.gov/37458921/))([Trial](https://clinicaltrials.gov/study/NCT01035255)), combined with a beta-blocker, an MRA, and an SGLT2 inhibitor ([NICE](https://www.nice.org.uk/...)). Diuretics are used for congestion relief."
+
+> The citations are **markdown links to the source URL** — never the article/journal title, and there is **no `[general clinical knowledge]` tag**. The last sentence is general knowledge, so it is stated plainly with no marker.
+
+`citedSourceIds = ["pubmed_37458921", "trial_NCT01035255", "web_1_nice_org_uk"]` (internal bookkeeping only — these ids never appear in the answer text).
+
+**Step [5] — Combined confidence**
+
+```text
+base = 0.5*0.874 + 0.5*0.9 = 0.887     (both > 0, so averaged)
+conflicts = false, unsupported = 0
+pct  = round(0.887 * 100) = 89          → band "answer_full"
+```
+
+**Step [6] — Response**
+
+`status="answered"`, `confidenceScore=89`, and only the 3 cited references get `usedInAnswer=true` in the returned list (see the full JSON in §6).
 
 ### 5.3 Strict Mode Stream Pipeline (SSE)
 
@@ -274,6 +349,45 @@ Form fields:
 
 Response: `StrictAnswerResponse` (see schema below).
 
+**Example request** (form-encoded):
+
+```bash
+curl -X POST http://localhost:8000/ask/strict/ \
+  -F 'question=first line treatment for HFrEF' \
+  -F 'library=cardiology' \
+  -F 'use_web=true' \
+  -F 'history_json=[{"role":"user","content":"what is HFrEF"},{"role":"assistant","content":"Heart failure with reduced ejection fraction (EF <= 40%)."}]'
+```
+
+**Example response** (trimmed — full schema below):
+
+```json
+{
+  "requestId": "9f1c2e7a-...",
+  "mode": "strict",
+  "answer": "First-line therapy for HFrEF is guideline-directed medical therapy: an ARNI (sacubitril/valsartan) is preferred over an ACE inhibitor [pubmed_37458921][trial_NCT01035255] ...",
+  "confidenceScore": 89,
+  "status": "answered",
+  "references": [
+    { "id": "pubmed_37458921", "title": "ARNI vs ACEi in HFrEF",
+      "source": "PubMed", "sourceType": "peer_reviewed_journal",
+      "url": "https://pubmed.ncbi.nlm.nih.gov/37458921/",
+      "usedInAnswer": true, "credibilityTier": "A", "publishedAt": "2023-08-01" },
+    { "id": "trial_NCT01035255", "title": "PARADIGM-HF",
+      "source": "ClinicalTrials.gov", "sourceType": "clinical_trial",
+      "url": "https://clinicaltrials.gov/study/NCT01035255",
+      "usedInAnswer": true, "credibilityTier": "A" }
+  ],
+  "verification": {
+    "evidenceStatus": "sufficient",
+    "internalRagConfidence": 0.874,
+    "externalEvidenceConfidence": 0.9,
+    "conflictsDetected": false,
+    "unsupportedClaimsRemoved": 0
+  }
+}
+```
+
 ### `POST /ask/strict/stream/`
 Same inputs as `/ask/strict/`. Returns `text/event-stream` with these events:
 
@@ -284,6 +398,29 @@ Same inputs as `/ask/strict/`. Returns `text/event-stream` with these events:
 | `delta` | `{ text }` — repeated as tokens stream |
 | `done` | `{ answer, confidenceScore, status, references (used), verification }` |
 | `error` | `{ message }` |
+
+**Example wire trace** (what actually goes over the socket):
+
+```text
+event: meta
+data: {"requestId":"9f1c2e7a-...","library":"cardiology"}
+
+event: references
+data: [{"id":"pubmed_37458921",...},{"id":"web_1_nice_org_uk",...}, ... all 16 candidates ...]
+
+event: delta
+data: {"text":"First-line"}
+
+event: delta
+data: {"text":" therapy for HFrEF"}
+
+... many delta frames ...
+
+event: done
+data: {"answer":"First-line therapy for HFrEF ...","confidenceScore":89,"status":"answered","references":[ ...only the cited ones... ]}
+```
+
+> Note the ordering: `references` carries **all** candidates so the UI can paint the source panel before a single token arrives; `done` carries only the **cited** subset (detected by scanning the streamed text for `[id]` brackets — see `stream_answer_strict`).
 
 ### Chat history endpoints
 
@@ -300,7 +437,7 @@ Same inputs as `/ask/strict/`. Returns `text/event-stream` with these events:
 {
   "requestId": "uuid",
   "mode": "strict",
-  "answer": "string with inline [source_id] citations",
+  "answer": "string with inline markdown links to source URLs (no id tags, no article titles)",
   "confidenceScore": 75,
   "status": "answered | partial | insufficient_evidence | conflicting_evidence",
   "references": [
@@ -345,14 +482,15 @@ Same inputs as `/ask/strict/`. Returns `text/event-stream` with these events:
 
 | Agent | Role | Output | Constraint |
 |---|---|---|---|
-| **Synthesizer (JSON)** | Used by `/ask/strict/`. | JSON `{answer, status, citedSourceIds}` | Inline `[source_id]` citations required. |
+| **Synthesizer (JSON)** | Used by `/ask/strict/`. | JSON `{answer, status, citedSourceIds}` | Inline markdown links to source URLs; `citedSourceIds` carries the ids separately. |
 | **Streaming synthesizer** | Used by `/ask/strict/stream/`. | Plain markdown prose token stream. | Same citation rules. |
 
 ### Prompt design
 
 - Synthesizer receives: question, last 6 conversation turns, internal chunks, external references (PubMed + web + FDA + trials).
 - Citation tag examples it knows about: `[pubmed_12345]`, `[web_0_cdc_gov]`, `[openfda_metformin_0]`, `[trial_NCT01234567]`, `[internal_3]`.
-- Sentences sourced from training-time medical knowledge are tagged `[general clinical knowledge]`.
+- Sentences sourced from training-time medical knowledge are stated plainly, with **no tag** (the old `[general clinical knowledge]` marker was removed — the prompt now forbids it).
+- Citations are **markdown links to the source's `url`** with a short label (PubMed / FDA / CDC / Trial / Internal); the answer never contains raw `id` tags or article/journal titles.
 - Fail-closed: any parsing error → abstention sentence.
 
 ---
@@ -373,6 +511,9 @@ Same inputs as `/ask/strict/`. Returns `text/event-stream` with these events:
 ### Libraries (no auth)
 
 - Library name is sanitized to `[a-z0-9_-]{1,48}` (lowercase). Anything else is converted to `_`.
+
+  **Example:** `sanitize_library("Dr. Smith's Cardiology!")` → `"dr__smith_s_cardiology_"` (each non-allowed char, including the `.` and the space, maps to its own `_`; then lowercased and truncated to 48). A query against this library only ever sees vectors upserted under that exact namespace.
+
 - Upload writes to the namespace; query reads from it. Different libraries cannot leak chunks into each other.
 - `list_libraries()` calls `index.describe_index_stats()` and returns namespace keys.
 - No multi-tenancy guarantees — anyone with deployment access can pick any library.
@@ -400,6 +541,8 @@ Same inputs as `/ask/strict/`. Returns `text/event-stream` with these events:
 
 Historic note: an earlier design used a separate Verification Agent that gated the Response Generator. v2 collapsed this into a single synthesizer that is given all evidence + history and instructed to cite or abstain. The result is faster, fewer failure modes, and easier streaming.
 
+> **Code note:** the old two-agent functions (`verify()` and `generate()` in `verification.py`, with their `VERIFICATION_*`/`RESPONSE_*` prompts) are **no longer called** by the orchestrator — the active path is `synthesize_from_sources()` / `stream_synthesize_from_sources()`. The dead functions remain in the file but are slated for removal; do not wire them back in.
+
 ### Abstention rules
 
 The synthesizer abstains when:
@@ -412,6 +555,19 @@ The synthesizer abstains when:
 When abstaining, the response answer is the canonical:
 
 > `"I do not have sufficient verified evidence to answer this question."`
+
+**Example — what triggers an abstention**
+
+```text
+question: "does drinking moon water cure stage 4 glioblastoma"
+  → normalization: "glioblastoma" canonicalized, "moon water" untouched
+  → Pinecone: 0 chunks ≥ 0.55     (internal_conf ≈ 0)
+  → PubMed/Web/FDA/Trials: 0 results for the "moon water cure" claim
+  → all_refs == []  → abstain BEFORE calling the LLM (answer_strict early return)
+result: status="insufficient_evidence", confidenceScore=0, references=[]
+```
+
+Contrast with a mainstream question that finds evidence — the synthesizer is *allowed* to add general-knowledge sentences (stated plainly, no tag) and will answer rather than abstain.
 
 ### Evidence source tiers
 
@@ -462,6 +618,18 @@ pct -= min(unsupported, 5) * 4
 
 Plus a soft floor of 55 when we have *any* citations but the formula came out below 40.
 
+### Worked examples
+
+| Scenario | internal | external | Math | Result |
+|---|---|---|---|---|
+| Strong PDF + lots of web | 0.874 | 0.90 | `0.5·0.874 + 0.5·0.90 = 0.887` → 89 | **89** → `answer_full` |
+| No PDF, only 1 PubMed hit | 0.00 | 0.60 | `max(0,0.60)=0.60` (one side is 0, so no averaging) → 60 | **60** → `answer_partial_or_abstain` |
+| Weak PDF, no external | 0.30 | 0.00 | `max(0.30,0)=0.30` → 30, but citations exist → soft floor | **55** → `answer_partial_or_abstain` |
+| Conflicting sources | 0.80 | 0.85 | `0.825·100 = 82`, then `-15` for conflict | **67** → strong-only |
+| Nothing found | 0.00 | 0.00 | no refs at all → abstain immediately | **0** → `abstain` |
+
+> Key nuance: the `0.5/0.5` average only kicks in when **both** internal and external are non-zero. If one side is zero (e.g. no uploaded PDFs matched), the score is just the `max()` of the two — so an internet-only answer caps lower than a corroborated one.
+
 ### Threshold bands
 
 | Band | Score | Action |
@@ -492,6 +660,21 @@ All four run concurrently in a `ThreadPoolExecutor(max_workers=4)` inside `_gath
 - No key: 340ms sleep between calls (3 rps).
 - With `NCBI_API_KEY`: 10 rps.
 
+**Example**
+
+```text
+query "Heart Failure with reduced Ejection Fraction"
+  → esearch  → PMIDs [37458921, 36154123, ...]
+  → esummary → titles, journals, pub dates
+  → efetch   → abstracts
+produces a Reference:
+  { "id": "pubmed_37458921",
+    "title": "Angiotensin–Neprilysin Inhibition vs ACEi in HFrEF",
+    "source": "PubMed", "sourceType": "peer_reviewed_journal",
+    "url": "https://pubmed.ncbi.nlm.nih.gov/37458921/",
+    "credibilityTier": "A", "publishedAt": "2023-08-01" }
+```
+
 ### 11.2 Tavily Web Search (`connectors/web_search.py`)
 
 POST `https://api.tavily.com/search` with `include_domains` set to a curated whitelist of ~35 medical domains:
@@ -511,6 +694,19 @@ POST `https://api.tavily.com/search` with `include_domains` set to a curated whi
 - Surfaces up to 4 of: indications, dosage, contraindications, warnings, adverse reactions, interactions, mechanism of action.
 - Tier **A**, `sourceType: "drug_label"`.
 - Reference IDs are `openfda_<term>_<i>`.
+
+**Example**
+
+```text
+question "first line treatment for HFrEF, is sacubitril safe?"
+  → candidate drug tokens: ["sacubitril", "treatment", ...]
+  → GET .../drug/label.json?search=openfda.generic_name:sacubitril ...
+  → hit → Reference:
+     { "id": "openfda_sacubitril_0", "source": "OpenFDA",
+       "sourceType": "drug_label", "credibilityTier": "A",
+       "keyFindings": ["Indications: HFrEF", "Dosage: 49/51 mg BID",
+                       "Contraindication: history of angioedema"] }
+```
 
 ### 11.4 ClinicalTrials.gov v2 (`connectors/clinicaltrials.py`)
 
@@ -541,7 +737,7 @@ Pipeline:
 1. Run evidence-gathering synchronously (so the UI can show references early).
 2. Emit `meta` and `references` immediately.
 3. Call `_llm().stream([...])` and yield each `delta`.
-4. After the stream ends, scan the collected text for `[source_id]` brackets to build the "used" reference list.
+4. After the stream ends, scan the collected text for source **URLs** to build the "used" reference list (matches each reference's `url` against the markdown links in the answer).
 5. Emit `done` with the assembled answer, status, confidence, and used references.
 
 ### Client side
@@ -666,7 +862,7 @@ Pipeline:
 
 - **Fail-closed** architecture — any error returns the abstention sentence.
 - **No diagnostic claims, no prescriptions** — synthesizer prompt forbids inventing dosages, statistics, or trial outcomes.
-- **Inline citations mandatory**; non-cited sentences must be tagged `[general clinical knowledge]`.
+- **Inline citations as markdown links** to source URLs; general-knowledge sentences are stated plainly with no tag (article/journal titles are never written into the answer).
 - **Strict mode** is the default UI path.
 
 ### API security
@@ -705,6 +901,9 @@ Pipeline:
 | `NCBI_CONTACT_EMAIL` | optional | NCBI policy |
 | `OPENFDA_API_KEY` | optional | Higher OpenFDA rate limit |
 | `CHAT_HISTORY_DIR` | optional | Override chat-history dir |
+| `SCISPACY_MODEL` | optional | scispaCy model (default `en_core_sci_lg`) |
+| `SCISPACY_LINKER` | optional | EntityLinker KB (default `umls`) |
+| `SCISPACY_LINKER_THRESHOLD` | optional | Min link score to canonicalize (default `0.7`) |
 
 ### Client (`client/config.py`)
 
@@ -755,9 +954,11 @@ docker-compose.yml
 
 ## 19. Future Integrations
 
-### 19.1 UMLS (Unified Medical Language System)
+### 19.1 UMLS — synonym expansion (partially shipped)
 
-Medical concept normalization and synonym expansion. Example: "heart attack" → `["myocardial infarction", "MI", "AMI"]` before retrieval. Dramatically improves recall.
+Medical concept normalization via scispaCy + UMLS EntityLinker is **implemented** — see `modules/medical_nlp.py` and §5.2 step [0]. It rewrites the doctor's wording to the UMLS-canonical name before retrieval (e.g. "heart attack" → "Myocardial Infarction").
+
+**Still future:** full synonym *expansion* (querying with multiple aliases, e.g. `["myocardial infarction", "MI", "AMI"]` simultaneously) to further improve recall. Today only the single canonical name is substituted.
 
 ### 19.2 Hybrid Reranker
 
@@ -801,7 +1002,7 @@ A `docker-compose.yml` for one-command local deploy.
 **v2 fix** (current state):
 
 - The separate Verification Agent was removed. A single synthesizer is given all evidence + history and instructed to cite or abstain.
-- The synthesizer prompt explicitly allows general clinical knowledge for mainstream facts, tagged `[general clinical knowledge]`.
+- The synthesizer prompt explicitly allows general clinical knowledge for mainstream facts (stated plainly; the earlier `[general clinical knowledge]` tag was later removed).
 - A soft confidence floor of 55 is applied whenever any citation is present, so the band doesn't collapse to "abstain" for low-but-non-empty evidence.
 - Streaming variant uses plain-prose output (no JSON parsing) so partial responses always render.
 

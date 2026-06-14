@@ -339,10 +339,12 @@ def stream_answer_strict(
 
     full_text = "".join(collected).strip()
 
-    # Best-effort: try to detect cited ids by scanning brackets in the streamed answer.
-    import re as _re
-    cited_ids = list({m for m in _re.findall(r"\[([A-Za-z0-9_\-]+)\]", full_text)})
-    used_refs = _filter_used(ev["all_refs"], cited_ids) if cited_ids else list(ev["all_refs"])
+    # Best-effort: detect which sources were used by matching their URLs in the answer's links.
+    used_refs = [r for r in ev["all_refs"] if r.url and r.url in full_text]
+    for r in used_refs:
+        r.usedInAnswer = True
+    if not used_refs:
+        used_refs = list(ev["all_refs"])
 
     internal_conf = ev["internal_conf"]
     external_score = ev["external_score"]
